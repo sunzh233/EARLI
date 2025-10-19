@@ -51,7 +51,7 @@ sudo apt-get update -y && sudo apt-get install -y git build-essential ninja-buil
 ```
 4. Install EARLI and its dependencies:
 ```bash
-pip install --upgrade --extra-index-url https://pypi.nvidia.com .
+pip install --upgrade --extra-index-url https://pypi.nvidia.com -c constraints.txt .
 ```
 
 
