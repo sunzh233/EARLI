@@ -63,16 +63,36 @@ pip install --upgrade --extra-index-url https://pypi.nvidia.com -c constraints.t
 ```bash
 docker pull ido90/earli:1.00
 ```
-3. Run the docker container with:
+3. Run either a command-line session or a Jupyter Lab inside the docker:
+
+#### Option A: Command-line
+* Run:
 ```bash
 docker run -it --rm --runtime=nvidia --network=host --gpus all -v <SOURCE_DIR_PATH>:/opt/source ido90/earli:1.00 /bin/bash
 ```
 where `<SOURCE_DIR_PATH>` is the path to the folder containing the EARLI source code and data files on your host machine.
-
-4. Inside the docker:
+* Inside the docker:
 ```bash
 cd /opt/source
 ```
+
+#### Option B: Jupyter Lab
+Run the command below and open the URL that it prints in the browser:
+```bash
+docker run --rm -it \
+  -p 127.0.0.1:8888:8888 \
+  -v "$PWD":/work -w /work --gpus all \
+  ido90/earli:1.00 \
+  bash -lc '
+    git config --global --add safe.directory /work || true
+    PY=/opt/conda/bin/python3
+    $PY -V
+    $PY -m pip install -q jupyterlab ipykernel
+    $PY -m jupyter lab --ip=0.0.0.0 --no-browser --port=8888 --allow-root
+  '
+```
+
+If port 8888 is occupied, replace it (e.g. `-p 127.0.0.1:8889:8888`) and adjust the URL accordingly when opening it in the browser.
 
 
 ## Option III: Build the Docker yourself
@@ -88,21 +108,6 @@ docker build --network=host -t earli:latest -f Dockerfile .
 Example for training is provided in [`ExampleTrain.ipynb`](ExampleTrain.ipynb).
 
 Example for inference is provided in [`Example.ipynb`](Example.ipynb). It can be used with our pretrained RL agents provided under `earli/pretrained_models/`, or with a new trained agent.
-
-If you use a docker and not a virtual environment (options II-III above), you may still run the Jupyter Notebooks within the docker, by running the command below and copying the printed URL into the browser:
-```
-docker run --rm -it \
-  -p 127.0.0.1:8888:8888 \
-  -v "$PWD":/work -w /work --gpus all \
-  ido90/earli:1.00 \
-  bash -lc '
-    git config --global --add safe.directory /work || true
-    PY=/opt/conda/bin/python3
-    $PY -V
-    $PY -m pip install -q jupyterlab ipykernel
-    $PY -m jupyter lab --ip=0.0.0.0 --no-browser --port=8888 --allow-root
-  '
-```
 
 
 # Data
