@@ -5,7 +5,7 @@ from tensordict import TensorDict
 from torch import Tensor
 
 # from rl4co.envs import RL4COEnvBase
-from ..attention_base.env_embeddings.init import VRPInitEmbedding
+from ..attention_base.env_embeddings.init import env_init_embedding
 from .graph.attnnet import GraphAttentionNetwork
 
 
@@ -41,8 +41,10 @@ class GraphAttentionEncoder(nn.Module):
         #     env_name = env_name.name
         self.env_name = env_name
 
-        self.init_embedding = VRPInitEmbedding(embedding_dim=embedding_dim, env_type=self.env_name,
-                                               eight_rounding=eight_rounding)
+        self.init_embedding = env_init_embedding(
+            env_name=self.env_name,
+            config={'embedding_dim': embedding_dim, 'linear_bias': True, 'env_type': self.env_name, 'eight_rounding': eight_rounding}
+        )
 
         self.net = GraphAttentionNetwork(
                 num_heads,

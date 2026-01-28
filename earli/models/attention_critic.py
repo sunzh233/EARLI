@@ -3,7 +3,7 @@ from typing import Callable, Optional, Union
 from tensordict import TensorDict
 from torch import Tensor, nn
 
-from .attention_base.env_embeddings.init import VRPInitEmbedding
+from .attention_base.env_embeddings.init import env_init_embedding
 from .attention_base.graph.attnnet import GraphAttentionNetwork
 
 
@@ -43,8 +43,10 @@ class CriticNetwork(nn.Module):
         normalization = config['attention_model']['layer_normalization']
         num_layers = config['attention_model']['n_attention_layers_critic']
         self.env_name = config['problem_setup']['env']
-        self.init_embedding = VRPInitEmbedding(embedding_dim=embedding_dim, env_type=self.env_name,
-                                               eight_rounding=config['model']['eight_rounding'])
+        self.init_embedding = env_init_embedding(
+            env_name=self.env_name,
+            config={'embedding_dim': embedding_dim, 'linear_bias': True, 'env_type': self.env_name, 'eight_rounding': config['model']['eight_rounding']}
+        )
         self.encoder = (
             GraphAttentionNetwork(
                     num_heads=num_heads,
