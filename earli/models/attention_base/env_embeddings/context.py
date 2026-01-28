@@ -29,6 +29,8 @@ def env_context_embedding(env_name: str, config: dict) -> nn.Module:
         "tsp": TSPContext,
         "atsp": TSPContext,
         "cvrp": VRPContext,
+        "vrp": VRPContext,
+        "vrptw": VRPContext,
         "sdvrp": VRPContext,
         "pctsp": PCTSPContext,
         "spctsp": PCTSPContext,
@@ -36,6 +38,7 @@ def env_context_embedding(env_name: str, config: dict) -> nn.Module:
         "dpp": DPPContext,
         "mdpp": DPPContext,
         "pdp": PDPContext,
+        "pdptw": PDPContext,
         "mtsp": MTSPContext,
         "smtwtp": SMTWTPContext,
     }
