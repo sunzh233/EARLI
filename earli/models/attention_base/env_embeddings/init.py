@@ -221,8 +221,9 @@ class PDPInitEmbedding(nn.Module):
            Note that pickups and deliveries are interleaved in the input.
     """
 
-    def __init__(self, embedding_dim, linear_bias=True, env_type='pdp'):
+    def __init__(self, embedding_dim, linear_bias=True, env_type='pdp', eight_rounding=False):
         super(PDPInitEmbedding, self).__init__()
+        # eight_rounding parameter is kept for API compatibility but not used in PDP
         node_dim_depot = 2  # x, y for depot
         node_dim_pick = 4  # x, y of pickup and delivery
         node_dim_delivery = 2  # x, y
