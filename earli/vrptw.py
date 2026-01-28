@@ -40,7 +40,7 @@ class VRPTW(RoutingBase):
         self.last_go_back_to_depot = self.config['problem_setup']['last_return_to_depot']
         self.extra_car_penalty = 0
         self.unused_capacity_penalty = 0
-        self.time_penalty = self.config['problem_setup'].get('time_penalty', 1.0) * self.reward_normalization
+        self.time_penalty = self.config['problem_setup'].get('time_penalty', 1000.0) * self.reward_normalization
         if self.config['problem_setup']['minimize_vehicles']:
             self.extra_car_penalty = self.config['problem_setup']['vehicle_penalty'] * self.radius
             self.extra_car_penalty *= self.reward_normalization

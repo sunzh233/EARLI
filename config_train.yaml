@@ -20,8 +20,8 @@ train:
   multi_gpu: False
   block_decreasing_action: False
   epochs: 0
-  batch_size: 1024
-  n_beams: 1
+  batch_size: 1600
+  n_beams: 2
   pretrained_fname: null
 #  pretrained_fname: 'earli/pretrained_models/model_vrp_100_L2.m'
 #  pretrained_fname: 'earli/pretrained_models/model_vrp_500_L2.m'
@@ -29,24 +29,24 @@ train:
 #  pretrained_fname: 'earli/pretrained_models/model_vrp_500_sp.m'
   pretrained_run: null
   save_model_path: 'earli/pretrained_models/new_vrp_model.m'
-  n_parallel_problems: 256 # should be >=1
+  n_parallel_problems: 8 # should be >=1
   learning_rate: 3e-4
 
 eval:
 #  data_file: datasets/synthetic_100.pkl
 #  data_file: datasets/synthetic_500.pkl
-  data_file: datasets/problem_instances/vrp-train-size-20-sp-n_problems-1000.pkl
+  data_file: datasets/homberger_pkl/train_200.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-100-sp-n_problems-256.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-500-sp-n_problems-256.pkl
   max_problems: null
-  apply_local_search: True
+  apply_local_search: False
   deterministic_test_beam: True
   detailed_test_log: False
   save_full_tree: False
   naive_greedy: False
 
 problem_setup:
-  env: vrp
+  env: vrptw
   problem_range: null  # null for all problems, otherwise [i, j] to load problems i to j-1
   minimize_vehicles: True
   last_return_to_depot: True
@@ -58,7 +58,7 @@ problem_setup:
 
 representation:
   input_repr: Graph
-  k_connectivity: 8
+  k_connectivity: 64
   self_loops: True
   normalize: True
   #####################
