@@ -80,6 +80,7 @@ class CuOptSolver(object):
         if type(distance_matrix) == torch.Tensor:
             distance_matrix = distance_matrix.cpu().numpy()
         n_nodes = distance_matrix.shape[0]
+        print(f"Number of nodes: {n_nodes}, Number of carriers: {n_carriers}")
         data_model = routing.DataModel(n_nodes, n_carriers)
 
         # Add cost matrix information

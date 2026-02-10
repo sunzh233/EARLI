@@ -206,7 +206,8 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
             extra_time_needed = NAIVE_RUNTIME
             external_solutions = external_solutions + naive_solutions[ind - problems_range[0]]
     elif 'naive' in method:
-        external_solutions = naive_solutions[ind - problems_range[0]]
+        # external_solutions = naive_solutions[ind - problems_range[0]]
+        external_solutions = []
     else:
         return external_solutions, np.nan, np.nan, 0
 
@@ -299,12 +300,12 @@ def get_initialization_runtimes(config, problem_size, methods):
         RL_RUNTIME = {50:0.005, 100:0.016, 200:0.079, 300:0.198, 400:0.421, 500:0.767}[problem_size]  # for 8 solutions
     else:
         RL_RUNTIME = float(RL_RUNTIME)
-    NAIVE_RUNTIME = config['injection']['naive_runtime']
+    NAIVE_RUNTIME = 0
     if NAIVE_RUNTIME is None:
         NAIVE_RUNTIME = {50:0.001, 100:0.001, 200:0.003, 300:0.008, 400:0.016, 500:0.027}[problem_size]  # for 1 solution
     else:
         NAIVE_RUNTIME = float(NAIVE_RUNTIME)
-    INIT_RUNTIMES = dict(cuOpt=0, cuOpt_RL0=0, cuOpt_naive=NAIVE_RUNTIME, cuOpt_RL=RL_RUNTIME)
+    INIT_RUNTIMES = dict(cuOpt=0, cuOpt_RL0=0, cuOpt_naive=0, cuOpt_RL=RL_RUNTIME)
     for method in methods:
         if method not in INIT_RUNTIMES:
             warnings.warn(f'Init-runtime undefined for method {method}. setting to 0.')
@@ -671,6 +672,26 @@ def main(config_path='config_initialization.yaml'):
                     method, ind, problems, n_carriers, rlopt_solutions, naive_solutions, problems_range, avoid_suboptimal_cars=avoid_suboptimal_cars, force_feasible=ga_time == 0, LP=LP,
                     BOTH_RL_AND_NAIVE=BOTH_RL_AND_NAIVE, NAIVE_RUNTIME=NAIVE_RUNTIME, USE_REF_VEHICLES=USE_REF_VEHICLES, ENV=ENV, SORT_SOLUTIONS=SORT_SOLUTIONS,
                     SOLUTIONS_FORMAT_HAS_NO_LAST_DEPOT=SOLUTIONS_FORMAT_HAS_NO_LAST_DEPOT)
+                
+                if external_solutions:
+                    try:
+                        # DEBUG: Robust car counting
+                        def count_cars_debug(sol_route):
+                            arr = np.array(sol_route)
+                            n_zeros = np.sum(arr == 0)
+                            if len(arr) > 0 and arr[-1] == 0:
+                                return n_zeros - 1
+                            return n_zeros
+
+                        max_inj_cars = max([count_cars_debug(sol[1]) for sol in external_solutions])
+                        print(f"DEBUG: n_carriers: {n_carriers}, max_inj_cars: {max_inj_cars}")
+
+                        if max_inj_cars >= n_carriers:
+                            print(f"DEBUG: Updating n_carriers to {max_inj_cars + 1} (safety margin)")
+                            n_carriers = int(max_inj_cars + 1)
+                    except Exception as e:
+                        print(f"DEBUG: Error updating n_carriers: {e}")
+
                 if extra_time_needed > 0:
                     init_runtime += extra_time_needed
                     ga_time = max(ga_time - extra_time_needed, 0)

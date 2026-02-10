@@ -145,6 +145,20 @@ class ProblemLoader(object):
         if 'config' in loaded_data_pkl:
             data['config'] = loaded_data_pkl['config']
 
+        # Load time window fields for VRPTW
+        for time_key in ['t_min', 't_max', 'dt']:
+            if time_key in loaded_data_pkl:
+                time_val = loaded_data_pkl[time_key]
+                if problem_range is not None:
+                    time_val = time_val[problem_range[0]:problem_range[1]]
+                if isinstance(time_val, np.ndarray):
+                    data[time_key] = torch.from_numpy(time_val).float()
+                elif isinstance(time_val, torch.Tensor):
+                    data[time_key] = time_val.float()
+                else:
+                    raise TypeError(f"Field '{time_key}' has unsupported type: {type(time_val)}")
+            # Note: Not raising error if missing, as it might be VRP without time windows
+
         # Load dataset_type if present (used for consistency check in vehicle_routing.py as data['env_type'])
         # This might be redundant if loaded_data_pkl['env_type'] is already used for data['env_type']
         if 'dataset_type' in loaded_data_pkl and 'env_type' not in loaded_data_pkl:
