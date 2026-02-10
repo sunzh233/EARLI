@@ -61,5 +61,6 @@ wheels/
 *.egg 
 
 datasets/*
+!datasets/README.md
 others/*
 outputs/*

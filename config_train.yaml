@@ -35,9 +35,10 @@ train:
 eval:
 #  data_file: datasets/synthetic_100.pkl
 #  data_file: datasets/synthetic_500.pkl
-  data_file: datasets/homberger_pkl/train_200.pkl
+#  data_file: datasets/homberger_pkl/train_200.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-100-sp-n_problems-256.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-500-sp-n_problems-256.pkl
+  data_file: datasets/vrptw_train_100.pkl  # Generated VRPTW training data
   max_problems: null
   apply_local_search: False
   deterministic_test_beam: True
