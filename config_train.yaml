@@ -21,7 +21,7 @@ train:
   block_decreasing_action: False
   epochs: 0
   batch_size: 1600
-  n_beams: 2
+  n_beams: 1
   pretrained_fname: null
 #  pretrained_fname: 'earli/pretrained_models/model_vrp_100_L2.m'
 #  pretrained_fname: 'earli/pretrained_models/model_vrp_500_L2.m'
