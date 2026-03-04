@@ -35,6 +35,13 @@ eval:
   #   python -m earli.benchmark_parser vrptw homberger/homberger_200_customer_instances \
   #           datasets/vrptw_200.pkl
   data_file: datasets/vrptw_200.pkl
+  # data_files: list of dataset files for mixed-size training (overrides data_file when set)
+  # Example:
+  # data_files:
+  #   - datasets/vrptw_100.pkl
+  #   - datasets/vrptw_200.pkl
+  #   - datasets/vrptw_400.pkl
+  data_files: null
   max_problems: null
   apply_local_search: True
   deterministic_test_beam: True

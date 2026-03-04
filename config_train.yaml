@@ -38,6 +38,13 @@ eval:
   data_file: datasets/problem_instances/vrp-train-size-20-sp-n_problems-1000.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-100-sp-n_problems-256.pkl
 #  data_file: datasets/problem_instances/vrp-test-size-500-sp-n_problems-256.pkl
+  # data_files: list of dataset files for mixed-size training (overrides data_file when set)
+  # Example:
+  # data_files:
+  #   - datasets/vrp_50.pkl
+  #   - datasets/vrp_100.pkl
+  #   - datasets/vrp_200.pkl
+  data_files: null
   max_problems: null
   apply_local_search: True
   deterministic_test_beam: True

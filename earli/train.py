@@ -67,15 +67,32 @@ def train(config_path: str, total_steps: int | None = None) -> None:
         )
     env_class = ENV_CLASSES[env_name]
 
-    data_file = config['eval']['data_file']
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(
-            f"Dataset file not found: {data_file}\n"
-            f"Generate it first with:\n"
-            f"  python -m earli.benchmark_parser {env_name} <benchmark_dir> {data_file}"
-        )
+    data_files = config['eval'].get('data_files')
+    data_file = config['eval'].get('data_file')
 
-    env = env_class(config, datafile=data_file, env_type='train')
+    if data_files:
+        # Mixed-size training: multiple dataset files of potentially different sizes.
+        # Each file is validated individually.
+        for f in data_files:
+            if not os.path.exists(f):
+                raise FileNotFoundError(
+                    f"Dataset file not found: {f}\n"
+                    f"Generate it first with:\n"
+                    f"  python -m earli.benchmark_parser {env_name} <benchmark_dir> {f}"
+                )
+        datafile = data_files  # pass as a list to the environment
+    elif data_file:
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(
+                f"Dataset file not found: {data_file}\n"
+                f"Generate it first with:\n"
+                f"  python -m earli.benchmark_parser {env_name} <benchmark_dir> {data_file}"
+            )
+        datafile = data_file
+    else:
+        raise ValueError("Config must specify either 'eval.data_file' or 'eval.data_files'.")
+
+    env = env_class(config, datafile=datafile, env_type='train')
 
     if total_steps is None:
         total_steps = config['train']['epochs'] * config['muzero']['data_steps_per_epoch']

@@ -15,7 +15,7 @@ from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvIndices
 from stable_baselines3.common.vec_env.util import obs_space_info
 from tensordict import TensorDict
 
-from .generate_data import ProblemLoader
+from .generate_data import ProblemLoader, MultiSizeDataLoader
 from .utils.nv import seed_all
 
 SIMPLE_MLP = 0
@@ -98,7 +98,14 @@ def slice_data(data, start_ind, skip, length):
 
 
 def get_problem_dataset(config, datafile, n_workers=1, worker_id=0):
-    data = ProblemLoader.load_problem_data(config=config, problem_range=config['problem_setup']['problem_range'], fname=datafile)
+    if isinstance(datafile, (list, tuple)):
+        data = MultiSizeDataLoader.load_mixed_data(
+            config=config,
+            fnames=datafile,
+            problem_range=config['problem_setup']['problem_range'],
+        )
+    else:
+        data = ProblemLoader.load_problem_data(config=config, problem_range=config['problem_setup']['problem_range'], fname=datafile)
     n_problems = data['positions'].shape[0] # n_problems is now part of loaded data
     starting_problem_ind = worker_id
     if n_workers > 1:
@@ -146,6 +153,14 @@ class RoutingBase(GymEnv, VecEnv):
             self.reward_normalization = 1 / self.radius
             if self.config['representation']['normalize_reward_by_problem_size']:
                 self.reward_normalization /= math.sqrt(3.14 * self.net_problem_size)
+            # Store per-problem valid-node mask for mixed-size training.
+            # When datasets of different sizes are merged and padded, each problem
+            # carries a boolean mask (True = real node, False = padding node).
+            n_ref, s_ref = self.data['positions'].shape[:2]
+            self.valid_mask_ref = self.data.get(
+                'valid_mask',
+                torch.ones(n_ref, s_ref, dtype=torch.bool),
+            )
             self.set_problem_data(data=self.data)
         else:
             raise NotImplementedError("On-the-fly problem generation is not implemented")

@@ -618,3 +618,164 @@ class TestPDPTW:
         env._step(actions)
         assert (env.current_time >= time_before).all(), \
             'Current time should not decrease after a step'
+
+
+# ---------------------------------------------------------------------------
+# Mixed-size data training tests
+# ---------------------------------------------------------------------------
+
+def _make_vrp_dataset(n_problems: int, n_nodes: int, capacity: float = 50.0) -> str:
+    """Create a minimal VRP dataset with *n_nodes* nodes and return its path."""
+    positions = torch.rand(n_problems, n_nodes, 2)
+    demand = torch.zeros(n_problems, n_nodes)
+    demand[:, 1:] = torch.randint(1, 5, (n_problems, n_nodes - 1)).float()
+
+    dm = torch.cdist(positions, positions, p=2)
+    idx = torch.arange(n_nodes)
+    dm[:, idx, idx] = 0.0
+
+    cap = torch.full((n_problems,), capacity)
+    radius = float(positions.abs().max())
+
+    data = {
+        'env_type': 'vrp',
+        'positions': positions,
+        'demand': demand,
+        'distance_matrix': dm,
+        'capacity': cap,
+        'n_problems': n_problems,
+        'radius': radius,
+        'id': np.arange(n_problems),
+    }
+    tmp = tempfile.NamedTemporaryFile(suffix='.pkl', delete=False)
+    pickle.dump(data, tmp)
+    tmp.close()
+    return tmp.name
+
+
+class TestMixedSizeDataTraining:
+    """Tests for mixed-size dataset loading and environment behaviour."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.vrp import VRP
+        self.VRP = VRP
+        # Two datasets with different problem sizes (including depot node)
+        self.pkl_small = _make_vrp_dataset(n_problems=4, n_nodes=6)   # 5 customers
+        self.pkl_large = _make_vrp_dataset(n_problems=4, n_nodes=11)  # 10 customers
+        yield
+        os.unlink(self.pkl_small)
+        os.unlink(self.pkl_large)
+
+    def _base_config(self, n_parallel: int = 4):
+        cfg = _make_base_config('vrp', n_beams=1, n_parallel=n_parallel)
+        cfg['problem_setup']['minimize_vehicles'] = False
+        return cfg
+
+    # ------------------------------------------------------------------
+    # MultiSizeDataLoader unit tests
+    # ------------------------------------------------------------------
+
+    def test_pad_dataset_shape(self):
+        """_pad_dataset pads tensors to max_size along the node dimension."""
+        from earli.generate_data import _pad_dataset, ProblemLoader
+        cfg = self._base_config()
+        data = ProblemLoader.load_problem_data(cfg, self.pkl_small)
+        n, orig_size = data['positions'].shape[:2]
+        padded = _pad_dataset(data, orig_size + 5)
+        assert padded['positions'].shape == (n, orig_size + 5, 2)
+        assert padded['demand'].shape == (n, orig_size + 5)
+        assert padded['distance_matrix'].shape == (n, orig_size + 5, orig_size + 5)
+        assert padded['valid_mask'].shape == (n, orig_size + 5)
+        # First orig_size columns of valid_mask must be True
+        assert padded['valid_mask'][:, :orig_size].all()
+        # Padding columns must be False
+        assert not padded['valid_mask'][:, orig_size:].any()
+
+    def test_merge_datasets_total_problems(self):
+        """_merge_datasets concatenates problems from both datasets."""
+        from earli.generate_data import _pad_dataset, _merge_datasets, ProblemLoader
+        cfg = self._base_config()
+        d_small = ProblemLoader.load_problem_data(cfg, self.pkl_small)
+        d_large = ProblemLoader.load_problem_data(cfg, self.pkl_large)
+        max_size = d_large['positions'].shape[1]
+        merged = _merge_datasets([_pad_dataset(d_small, max_size),
+                                  _pad_dataset(d_large, max_size)])
+        assert merged['n_problems'] == d_small['n_problems'] + d_large['n_problems']
+        assert merged['positions'].shape[1] == max_size
+
+    def test_mixed_load_valid_mask_present(self):
+        """MultiSizeDataLoader.load_mixed_data adds a valid_mask field."""
+        from earli.generate_data import MultiSizeDataLoader
+        cfg = self._base_config()
+        data = MultiSizeDataLoader.load_mixed_data(
+            cfg, [self.pkl_small, self.pkl_large]
+        )
+        assert 'valid_mask' in data, "valid_mask must be present after mixed load"
+        n, max_size = data['positions'].shape[:2]
+        assert data['valid_mask'].shape == (n, max_size)
+        assert data['valid_mask'].dtype == torch.bool
+
+    def test_mixed_load_padding_nodes_zeroed(self):
+        """Padding nodes must have zero demand and zero positions in the merged dataset."""
+        from earli.generate_data import MultiSizeDataLoader
+        cfg = self._base_config()
+        data = MultiSizeDataLoader.load_mixed_data(
+            cfg, [self.pkl_small, self.pkl_large]
+        )
+        vm = data['valid_mask']           # (n_total, max_size)
+        demand = data['demand']           # (n_total, max_size)
+        # Where valid_mask is False (padding), demand must be zero
+        assert (demand[~vm] == 0).all(), "Padding nodes must have zero demand"
+
+    def test_single_file_returns_valid_mask(self):
+        """Loading a single file still produces a valid_mask (all-True)."""
+        from earli.generate_data import MultiSizeDataLoader
+        cfg = self._base_config()
+        data = MultiSizeDataLoader.load_mixed_data(cfg, [self.pkl_small])
+        assert 'valid_mask' in data
+        assert data['valid_mask'].all(), "Single-file load: valid_mask must be all-True"
+
+    # ------------------------------------------------------------------
+    # Environment integration tests
+    # ------------------------------------------------------------------
+
+    def test_env_loads_mixed_data(self):
+        """VRP environment initialises without error on mixed-size data files."""
+        cfg = self._base_config(n_parallel=4)
+        env = self.VRP(cfg, datafile=[self.pkl_small, self.pkl_large], env_type='eval')
+        # problem_size should equal the larger dataset's node count
+        from earli.generate_data import ProblemLoader
+        d_large = ProblemLoader.load_problem_data(cfg, self.pkl_large)
+        assert env.problem_size == d_large['positions'].shape[1]
+
+    def test_padding_nodes_infeasible_after_reset(self):
+        """Padding nodes must be infeasible (feasible_nodes == False) after reset."""
+        cfg = self._base_config(n_parallel=4)
+        env = self.VRP(cfg, datafile=[self.pkl_small, self.pkl_large], env_type='eval')
+        env.reset()
+        # The small-dataset problems (first 4 problems, cycled) have fewer real nodes.
+        # Their padding slots must all be infeasible.
+        # padding_mask has shape (n_parallel, problem_size); check it is applied.
+        pm = env.padding_mask  # (n_parallel, [n_beams,] problem_size)
+        fn = env.feasible_nodes
+        # Wherever padding_mask is False (padding node), feasible_nodes must also be False
+        if pm.dim() == fn.dim():
+            padding_slots = ~pm
+        else:
+            padding_slots = ~pm.unsqueeze(1).expand_as(fn)
+        assert not fn[padding_slots].any(), \
+            "Padding nodes must be infeasible after reset"
+
+    def test_no_padding_for_single_size_dataset(self):
+        """When all datasets have the same size, padding_mask should be all-True."""
+        cfg = self._base_config(n_parallel=4)
+        # Two datasets of the same size (6 nodes)
+        pkl2 = _make_vrp_dataset(n_problems=4, n_nodes=6)
+        try:
+            env = self.VRP(cfg, datafile=[self.pkl_small, pkl2], env_type='eval')
+            env.reset()
+            assert env.padding_mask.all(), \
+                "All-same-size datasets: padding_mask must be all-True"
+        finally:
+            os.unlink(pkl2)
