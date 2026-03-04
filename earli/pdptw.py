@@ -162,6 +162,13 @@ class PDPTW(VRPTW):
         super().reset_dynamic_properties(indices, n_envs_to_reset)
         self.pickup_done[indices] = False
 
+        # Delivery nodes are infeasible until their paired pickup is visited.
+        if self.extended_output_format:
+            is_delv = self.ref_is_delivery[indices].unsqueeze(1)  # (n_reset, 1, n_nodes)
+        else:
+            is_delv = self.ref_is_delivery[indices]               # (n_reset, n_nodes)
+        self.feasible_nodes[indices] &= ~is_delv
+
     # ------------------------------------------------------------------
     # Step
     # ------------------------------------------------------------------
