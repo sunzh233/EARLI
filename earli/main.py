@@ -12,16 +12,28 @@ from .evaluator import Evaluator
 from .unified_logger import UnifiedLogger
 from .utils.nv import verify_consistent_config
 from .vrp import VRP
+from .vrptw import VRPTW
+from .pdptw import PDPTW
+
+
+ENV_CLASSES = {
+    'vrp'  : VRP,
+    'vrptw': VRPTW,
+    'pdptw': PDPTW,
+}
+
 
 def main(config_path='config.yaml'):
     with open(config_path) as f:
         config = yaml.load(f, Loader=SafeLoader)
     config = verify_consistent_config(config)
     logger = UnifiedLogger(config)
-    # wandb_mode = 'online' if config['system']['allow_wandb'] else 'disabled'
     wandb_mode = 'disabled'
     wandb.init(mode=wandb_mode)
-    env_class = VRP
+    env_name = config['problem_setup']['env'].lower()
+    if env_name not in ENV_CLASSES:
+        raise ValueError(f"Unknown env type '{env_name}'. Choose from: {list(ENV_CLASSES.keys())}")
+    env_class = ENV_CLASSES[env_name]
     evaluator = Evaluator(env_class, config, logger)
     print(f'Applying RL solver to {evaluator.n_problems["test"]} problem instances...')
     evaluator.inference()
