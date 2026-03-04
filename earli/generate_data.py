@@ -152,6 +152,42 @@ class ProblemLoader(object):
             data['env_type'] = loaded_data_pkl['dataset_type']
 
 
+        # 6. time_windows (optional, for VRPTW / PDPTW)
+        if 'time_windows' in loaded_data_pkl:
+            tw_val = loaded_data_pkl['time_windows']
+            if problem_range is not None:
+                tw_val = tw_val[problem_range[0]:problem_range[1]]
+            if isinstance(tw_val, np.ndarray):
+                data['time_windows'] = torch.from_numpy(tw_val).float()
+            elif isinstance(tw_val, torch.Tensor):
+                data['time_windows'] = tw_val.float()
+            else:
+                raise TypeError(f"Field 'time_windows' has unsupported type: {type(tw_val)}")
+
+        # 7. service_times (optional, for VRPTW / PDPTW)
+        if 'service_times' in loaded_data_pkl:
+            svc_val = loaded_data_pkl['service_times']
+            if problem_range is not None:
+                svc_val = svc_val[problem_range[0]:problem_range[1]]
+            if isinstance(svc_val, np.ndarray):
+                data['service_times'] = torch.from_numpy(svc_val).float()
+            elif isinstance(svc_val, torch.Tensor):
+                data['service_times'] = svc_val.float()
+            else:
+                raise TypeError(f"Field 'service_times' has unsupported type: {type(svc_val)}")
+
+        # 8. pairs (optional, for PDPTW) - pickup-delivery pairs (n_pairs, 2)
+        if 'pairs' in loaded_data_pkl:
+            pairs_val = loaded_data_pkl['pairs']
+            if problem_range is not None:
+                pairs_val = pairs_val[problem_range[0]:problem_range[1]]
+            if isinstance(pairs_val, np.ndarray):
+                data['pairs'] = torch.from_numpy(pairs_val).long()
+            elif isinstance(pairs_val, torch.Tensor):
+                data['pairs'] = pairs_val.long()
+            else:
+                raise TypeError(f"Field 'pairs' has unsupported type: {type(pairs_val)}")
+
         # Ensure essential data used by RoutingBase.set_problem_data is present
         for key_check in ['positions', 'demand', 'distance_matrix', 'capacity', 'id', 'n_problems', 'radius', 'env_type']:
             if key_check not in data:

@@ -17,6 +17,7 @@ def env_init_embedding(env_name: str, config: dict) -> nn.Module:
         "cvrp"  : VRPInitEmbedding,
         "vrp"   : VRPInitEmbedding,
         "vrptw" : VRPInitEmbedding,
+        "pdptw" : VRPInitEmbedding,
         "sdvrp" : VRPInitEmbedding,
         "pctsp" : PCTSPInitEmbedding,
         "spctsp": PCTSPInitEmbedding,
@@ -64,12 +65,16 @@ class VRPInitEmbedding(nn.Module):
         self.eight_rounding = eight_rounding
         node_dim = 8 if eight_rounding else 7  # x, y, demand, head, capacity, remaining_demand, unvisited_fraction + Padded to 8 to use TC
         self.node_features = ('loc', 'demand', 'head_feature', 'capacity', 'remaining_demand', 'remaining_nodes')
-        if env_type == 'vrptw':
+        if env_type in ('vrptw', 'pdptw'):
             if eight_rounding:
                 node_dim = 16
             else:
                 node_dim += 3
             self.node_features += ('tmin', 'tmax', 'dt')  # +Padded to 16 to use TC
+        if env_type == 'pdptw':
+            # Additional pair-awareness features: is_pickup, is_delivery, pickup_done
+            node_dim += 3
+            self.node_features += ('is_pickup', 'is_delivery', 'pickup_done')
         self.pad_dim = node_dim - len(self.node_features)-1
         self.init_embed = nn.Linear(node_dim, embedding_dim, linear_bias)
         self.init_embed_depot = nn.Linear(node_dim, embedding_dim, linear_bias)  # depot embedding
