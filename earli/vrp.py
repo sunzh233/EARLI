@@ -164,8 +164,14 @@ class VRP(RoutingBase):
             self.demand[indices] = demand
             self.capacity[indices] = 1.0
         else:
-            self.demand[indices] = self.initial_demand[indices].clone()
-            self.capacity[indices] = self.max_capacity[indices].clone()
+            demand = self.initial_demand[indices].clone()
+            if self.extended_output_format:
+                demand = demand.unsqueeze(1).expand_as(self.demand[indices])
+            self.demand[indices] = demand
+            capacity = self.max_capacity[indices].clone()
+            if self.extended_output_format:
+                capacity = capacity.unsqueeze(-1).unsqueeze(-1).expand_as(self.capacity[indices])
+            self.capacity[indices] = capacity
 
     def reset_static_properties(self, n_problems_to_reset, copy_all, indices):
         dataset_size = self.reference['positions'].shape[0]

@@ -126,6 +126,24 @@ class VRPTW(VRP):
         super().reset_dynamic_properties(indices, n_envs_to_reset)
         self.current_time[indices] = 0.0
 
+        # Apply initial time-window feasibility: block nodes that cannot be
+        # reached from the depot before their due_date.
+        ref_tw_idx  = self.ref_time_windows[indices]    # (n_reset, n_nodes, 2)
+        ref_svc_idx = self.ref_service_times[indices]   # (n_reset, n_nodes)
+        due         = ref_tw_idx[:, :, 1]               # (n_reset, n_nodes)
+        svc_depot   = ref_svc_idx[:, DEPOT_LOCATION]    # (n_reset,)
+
+        if self.extended_output_format:
+            dist_depot = self.distance_matrix[indices][:, :, DEPOT_LOCATION, :]  # (n_reset, n_beams, n_nodes)
+            arrive = svc_depot.unsqueeze(-1).unsqueeze(-1) + dist_depot
+            tw_ok  = arrive <= due.unsqueeze(1)          # broadcast to (n_reset, n_beams, n_nodes)
+        else:
+            dist_depot = self.distance_matrix[indices][:, DEPOT_LOCATION, :]     # (n_reset, n_nodes)
+            arrive = svc_depot.unsqueeze(-1) + dist_depot
+            tw_ok  = arrive <= due                       # (n_reset, n_nodes)
+
+        self.feasible_nodes[indices] &= tw_ok
+
     # ------------------------------------------------------------------
     # Step
     # ------------------------------------------------------------------
