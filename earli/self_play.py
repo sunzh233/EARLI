@@ -56,9 +56,21 @@ class SelfPlay:
     def set_weights(self, weights, id=None):
         self.model.set_weights(weights, id=id)
 
-    def play_game(self, deterministic=True, detailed_log=False):
-        """
-        Play one game to generate solutions.
+    def play_game(self, deterministic=True, detailed_log=False, training=False):
+        """Play one game to generate solutions.
+
+        Parameters
+        ----------
+        deterministic : bool
+            Whether to sample actions deterministically.
+        detailed_log : int or bool
+            Verbosity level for detailed logging.
+        training : bool
+            When ``True``, record per-step observations / policy logits /
+            actions so that PPO training data can be extracted from the
+            best trajectory found by the tree.  The returned ``infos``
+            dict will contain a ``'training_data'`` key holding a
+            ``TensorDict`` ready for gradient updates.
         """
         light_buffer = True
         lazy = True
@@ -69,7 +81,14 @@ class SelfPlay:
         self.model.eval()
         observations = self.game.reset()
         infos = {'env_id': self.game.ids}
-        
+
+        # Training history buffers (only allocated when training=True)
+        if training:
+            obs_history: list = []
+            actions_history: list = []
+            policy_logits_history: list = []
+            rewards_history: list = []
+
         # Initial forward pass
         with torch.inference_mode():
             with torch.autocast(device_type=self.model.device, dtype=torch.float16, enabled=self.amp):
@@ -108,6 +127,16 @@ class SelfPlay:
 
             total_actions_this_step = (actions != -1).sum().item()
             new_observations, rewards, dones, _ = self.game.step(actions, automatic_reset=False)
+
+            # Store history for training data extraction
+            if training:
+                # Store on CPU to avoid GPU memory exhaustion during long episodes.
+                obs_history.append(observations.to('cpu').clone())
+                actions_history.append(actions.clone().cpu())
+                policy_logits_history.append(policy_logits.clone().cpu())
+                # rewards indexed by destination beam (same as actions)
+                rewards_history.append(rewards.clone().cpu() if torch.is_tensor(rewards)
+                                       else torch.tensor(rewards))
             
             # Update tree
             trees.expand_and_update_tree(
@@ -141,11 +170,22 @@ class SelfPlay:
             done_trees = trees.dones()
             done = iter_count > self.config['muzero']['max_moves'] or dones.all() or all(done_trees)
         
-        # Get final results
+        # Get final results (inference path – always light_buffer)
         game_histories, game_infos = trees.backpropagate_and_fill_buffer(detailed_log=detailed_log,
                                                                          light_buffer=True)
         infos.update(game_infos)
-        
+
+        # Build PPO training data from stored history
+        if training and obs_history:
+            training_data = trees.build_training_data_from_history(
+                obs_history=obs_history,
+                actions_history=actions_history,
+                policy_logits_history=policy_logits_history,
+                rewards_history=rewards_history,
+                sampler=self.sampler,
+            )
+            infos['training_data'] = training_data
+
         return game_histories, infos
 
 

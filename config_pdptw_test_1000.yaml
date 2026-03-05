@@ -1,5 +1,6 @@
----
-# Configuration for VRPTW model training using Homberger benchmark data
+# Configuration for PDPTW inference on Li&Lim n=1000 benchmark (test only).
+# The n=1000 scale instances are EXCLUSIVELY used for testing – never for training
+# or validation.
 system:
   env_device: cpu
   model_device: cuda
@@ -10,14 +11,9 @@ system:
   allow_wandb: False
   run_name: null
   no_sweep: False
-  # compatibility_mode must be null for tree_based training (tensors required).
-  # Set to stable_baselines when using method: ppo.
   compatibility_mode: null
 
 train:
-  # tree_based: tree-search guided PPO (higher data quality, recommended).
-  #   Requires compatibility_mode: null and n_beams >= 2.
-  # ppo: Stable-Baselines3 PPO (simpler, requires compatibility_mode: stable_baselines).
   method: 'tree_based'
   optimizer: 'adam'
   seed: 0
@@ -25,27 +21,19 @@ train:
   gamma: 1
   multi_gpu: False
   block_decreasing_action: False
-  epochs: 100
-  batch_size: 512
-  n_beams: 4           # >= 2 enables true tree search; 1 degenerates to single-beam rollout
-  pretrained_fname: null
+  epochs: 0
+  batch_size: 1024
+  n_beams: 8
+  pretrained_fname: null   # set to pretrained model path before running
   pretrained_run: null
-  save_model_path: 'earli/pretrained_models/model_vrptw.m'
   n_parallel_problems: 16
   learning_rate: 3e-4
 
 eval:
-  # Run benchmark_parser.py to generate this file first:
-  #   python -m earli.benchmark_parser vrptw homberger/homberger_200_customer_instances \
-  #           datasets/vrptw_200.pkl
-  data_file: datasets/vrptw_200.pkl
-  # data_files: list of dataset files for mixed-size training (overrides data_file when set)
-  # Example:
-  # data_files:
-  #   - datasets/vrptw_100.pkl
-  #   - datasets/vrptw_200.pkl
-  #   - datasets/vrptw_400.pkl
-  data_files: null
+  # Run benchmark_parser.py first:
+  #   python -m earli.benchmark_parser pdptw "li&lim benchmark/pdptw1000" \
+  #           datasets/pdptw_1000.pkl
+  data_file: datasets/pdptw_1000.pkl
   max_problems: null
   apply_local_search: True
   deterministic_test_beam: True
@@ -54,7 +42,7 @@ eval:
   naive_greedy: False
 
 problem_setup:
-  env: vrptw
+  env: pdptw
   problem_range: null
   minimize_vehicles: True
   last_return_to_depot: True

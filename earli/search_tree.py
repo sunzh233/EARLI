@@ -97,6 +97,174 @@ class SearchTree(object):
         self.parent[self.frontier_index + 1] = parents
 
 
+    def build_training_data_from_history(self, obs_history, actions_history,
+                                          policy_logits_history, rewards_history,
+                                          sampler):
+        """Extract PPO training data from the best trajectory found by tree search.
+
+        Parameters
+        ----------
+        obs_history : list[TensorDict]
+            Observations (on CPU) at each step, shape ``(n_problems, k_beams, ...)``.
+        actions_history : list[Tensor]
+            Actions (on CPU) taken by each *destination* beam at each step,
+            shape ``(n_problems, k_beams)``.
+        policy_logits_history : list[Tensor]
+            Policy logits (on CPU) for each beam at each step,
+            shape ``(n_problems, k_beams, n_nodes)``.
+        rewards_history : list[Tensor]
+            Rewards (on CPU) received by each beam at each step (same indexing as
+            ``actions_history``), shape ``(n_problems, k_beams)``.
+        sampler : Sampler
+            Used to compute per-node log-probabilities from stored logits.
+
+        Returns
+        -------
+        TensorDict
+            Concatenated training data for all problems with keys:
+            ``observations``, ``actions``, ``log_prob``, ``rewards``,
+            ``returns``.  ``observations`` is itself a TensorDict.
+        """
+        terminal_actions = self.terminal_actions          # (max_steps, n, k)
+        terminal_actions_positions = terminal_actions.nonzero()  # (M, 3): step,prob,beam
+
+        if terminal_actions_positions.shape[0] == 0:
+            # No terminal actions found (degenerate game); return empty buffer.
+            return TensorDict({}, batch_size=(0,))
+
+        max_t, n_problems, k_beams = self.buffer['actions'].shape
+
+        # ---- find best beam per problem (mirrors light_buffer=True logic) ----
+        terminal_states_returns = self.buffer['rewards'].sum(dim=0)  # (n, k)
+        _, best_return_index = terminal_states_returns.max(dim=1)    # (n,)
+
+        # Compute first terminal step per (problem, beam).
+        # We replicate the +1 shift from backpropagate_and_fill_buffer so that
+        # first_true_indices[i, k] == actual_terminal_step + 1 (= trajectory length).
+        # Non-terminal beams keep the default value (max_t - 1); they are never
+        # selected as the best beam under normal circumstances.
+        terminal_indices = terminal_actions_positions.transpose(1, 0).unbind()
+        first_true_indices = torch.full(
+            (n_problems, k_beams), max_t - 1, dtype=torch.long,
+            device=terminal_states_returns.device,
+        )
+        shifted_step = terminal_actions_positions[:, 0] + 1   # step + 1 = traj length
+        first_true_indices[terminal_indices[1], terminal_indices[2]] = shifted_step
+
+        if self.config['problem_setup']['minimize_vehicles']:
+            composite_key = (terminal_actions_positions[:, 1] * k_beams
+                             + terminal_actions_positions[:, 2])
+            sort_indices = torch.argsort(composite_key)
+            sorted_tp = terminal_actions_positions[sort_indices]
+            vehicles_per_beam = sorted_tp[:, 0].reshape(n_problems, k_beams)
+            best_solution_per_problem, _ = self._select_best_beam(
+                terminal_states_returns, vehicles_per_beam)
+        else:
+            best_solution_per_problem = best_return_index  # (n,)
+
+        # Extract observation keys once – all problems share the same observation space.
+        obs_keys = list(obs_history[0].keys()) if obs_history else []
+
+        # ---- extract per-problem training trajectory ----
+        output_buffers = []
+        for i in range(n_problems):
+            best_beam = int(best_solution_per_problem[i].item())
+            # T = trajectory length (actual_terminal_step + 1)
+            T = int(first_true_indices[i, best_beam].item())
+
+            # Guard: trajectory must have at least one step.
+            if T <= 0:
+                continue
+
+            # Actual terminal step index (0-based) = T - 1
+            t_actual = T - 1
+
+            # The parent of best_beam at the terminal step is action_head_source.
+            if t_actual > 0:
+                terminal_beam = int(
+                    self.action_head_source[t_actual, i, best_beam].item()
+                )
+            else:
+                # Single-step episode: the only beam is its own parent.
+                terminal_beam = best_beam
+
+            terminal_action_t = torch.tensor(best_beam, dtype=torch.int)
+            beam_index, action_index, _ = self.get_trajectory_upto_head(
+                t_actual, i,
+                terminal_beam=terminal_beam,
+                terminal_action=terminal_action_t,
+                calculate_buffer=False,
+            )
+            # beam_index  (T,): source beam at each step 0..t_actual
+            # action_index (T,): destination-beam / action index at each step
+
+            T_eff = beam_index.shape[0]   # == T
+            if T_eff == 0:
+                continue
+
+            # Guard: history must be long enough.
+            if T_eff > len(obs_history):
+                continue
+
+            # ---- observations ----
+            # Each obs_history[t] is a TensorDict with batch_size (n_problems, k_beams).
+            # Index to get a scalar-batch TensorDict for the source beam.
+            obs_seq_list = []
+            for t in range(T_eff):
+                b = int(beam_index[t].item())
+                obs_seq_list.append(obs_history[t][i, b])   # batch_size ()
+
+            # Stack into a TensorDict with batch_size (T_eff,).
+            # We do it manually to avoid relying on torch.stack for TensorDicts.
+            # obs_keys is shared across all problems (same observation space).
+            obs_stacked = TensorDict(
+                {k: torch.stack([obs_seq_list[t][k] for t in range(T_eff)])
+                 for k in obs_keys},
+                batch_size=(T_eff,),
+            )
+
+            # ---- actions (destination nodes) ----
+            actions_seq = torch.stack([
+                actions_history[t][i, int(action_index[t].item())]
+                for t in range(T_eff)
+            ])  # (T_eff,)
+
+            # ---- rewards ----
+            rewards_seq = torch.stack([
+                rewards_history[t][i, int(action_index[t].item())]
+                for t in range(T_eff)
+            ]).float()   # (T_eff,)
+
+            # ---- old log-probs: P(destination node | source-beam policy) ----
+            log_probs_list = []
+            for t in range(T_eff):
+                b = int(beam_index[t].item())
+                logits_t   = policy_logits_history[t][i, b]              # (n_nodes,)
+                feasible_t = obs_history[t]['feasible_nodes'][i, b]      # (n_nodes,)
+                action_t   = actions_seq[t].unsqueeze(0)                 # (1,)
+                with torch.no_grad():
+                    _, lp, _ = sampler.sample(
+                        logits_t.unsqueeze(0),
+                        feasible_t.unsqueeze(0),
+                        action=action_t,
+                    )
+                log_probs_list.append(lp.squeeze(0))
+            log_probs_seq = torch.stack(log_probs_list).float()  # (T_eff,)
+
+            returns_seq = rewards_seq.flip(0).cumsum(0).flip(0)  # (T_eff,)
+
+            output_buffers.append(TensorDict({
+                'observations': obs_stacked,
+                'actions'     : actions_seq,
+                'log_prob'    : log_probs_seq,
+                'rewards'     : rewards_seq,
+                'returns'     : returns_seq,
+            }, batch_size=(T_eff,)))
+
+        if not output_buffers:
+            return TensorDict({}, batch_size=(0,))
+        return torch.cat(output_buffers)
+
     def backpropagate_and_fill_buffer(self, detailed_log=0, light_buffer=False):
         """
         At the end of a simulation, we propagate the evaluation all the way up the tree

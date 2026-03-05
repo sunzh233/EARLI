@@ -1,50 +1,41 @@
----
-# Configuration for VRPTW model training using Homberger benchmark data
+# Configuration for PDPTW model training using PPO (Stable-Baselines3)
+# Uses Li&Lim 100-customer benchmark for training (small scale).
+# NOTE: n=1000 instances must NOT be used for training or validation – test only.
 system:
   env_device: cpu
   model_device: cuda
   tree_device: cpu
   buffer_device: cpu
   save_obs_on_gpu: True
-  use_tensordict: True
+  use_tensordict: False
   allow_wandb: False
   run_name: null
   no_sweep: False
-  # compatibility_mode must be null for tree_based training (tensors required).
-  # Set to stable_baselines when using method: ppo.
-  compatibility_mode: null
+  # PPO (SB3) requires compatibility_mode: stable_baselines
+  compatibility_mode: stable_baselines
 
 train:
-  # tree_based: tree-search guided PPO (higher data quality, recommended).
-  #   Requires compatibility_mode: null and n_beams >= 2.
-  # ppo: Stable-Baselines3 PPO (simpler, requires compatibility_mode: stable_baselines).
-  method: 'tree_based'
+  method: 'ppo'
   optimizer: 'adam'
   seed: 0
   deterministic_algo: True
   gamma: 1
   multi_gpu: False
   block_decreasing_action: False
-  epochs: 100
+  epochs: 20
   batch_size: 512
-  n_beams: 4           # >= 2 enables true tree search; 1 degenerates to single-beam rollout
+  n_beams: 1
   pretrained_fname: null
   pretrained_run: null
-  save_model_path: 'earli/pretrained_models/model_vrptw.m'
+  save_model_path: 'earli/pretrained_models/model_pdptw_ppo.m'
   n_parallel_problems: 16
   learning_rate: 3e-4
 
 eval:
-  # Run benchmark_parser.py to generate this file first:
-  #   python -m earli.benchmark_parser vrptw homberger/homberger_200_customer_instances \
-  #           datasets/vrptw_200.pkl
-  data_file: datasets/vrptw_200.pkl
-  # data_files: list of dataset files for mixed-size training (overrides data_file when set)
-  # Example:
-  # data_files:
-  #   - datasets/vrptw_100.pkl
-  #   - datasets/vrptw_200.pkl
-  #   - datasets/vrptw_400.pkl
+  # Run benchmark_parser.py first:
+  #   python -m earli.benchmark_parser pdptw "li&lim benchmark/pdp_100" \
+  #           datasets/pdptw_100.pkl
+  data_file: datasets/pdptw_100.pkl
   data_files: null
   max_problems: null
   apply_local_search: True
@@ -54,7 +45,7 @@ eval:
   naive_greedy: False
 
 problem_setup:
-  env: vrptw
+  env: pdptw
   problem_range: null
   minimize_vehicles: True
   last_return_to_depot: True
@@ -120,8 +111,8 @@ sampler:
   autoregressive: True
 
 muzero:
-  expansion_method: 'KPPO'
-  deterministic_branch_in_k_beams: True
+  expansion_method: 'POLICY_LEAD_SEARCH'
+  deterministic_branch_in_k_beams: False
   zeroize_deterministic_log_prob: False
   loss_type: 'ppo'
   max_leaves: 10
