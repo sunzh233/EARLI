@@ -58,7 +58,7 @@ def verify_consistent_config(config, warn=True):
             ('speedups', 'compile_mode'), ('default', 'reduce-overhead', 'max-autotune'),
             ('speedups', 'amp'), False)
 
-    # SB3 Assertions should be last!
+    # SB3 / tree_based assertions should be last!
     if config['train']['method'].lower() == 'ppo':
         config['train']['method'] = 'ppo'
     assert_consistent_property(
@@ -73,6 +73,14 @@ def verify_consistent_config(config, warn=True):
     assert_consistent_property(
             ('train', 'method'), 'ppo',
             ('muzero', 'expansion_method'), 'POLICY_LEAD_SEARCH')  # to avoid a k-beams env
+
+    # tree_based training requires tensor-mode (not stable_baselines compatibility)
+    if config['train']['method'].lower() == 'tree_based':
+        if config['system'].get('compatibility_mode') == 'stable_baselines':
+            set_field(('system', 'compatibility_mode'), None)
+        assert_consistent_property(
+                ('train', 'method'), 'tree_based',
+                ('system', 'use_tensordict'), True)
 
     return config
 

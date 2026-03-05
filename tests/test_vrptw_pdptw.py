@@ -779,3 +779,215 @@ class TestMixedSizeDataTraining:
                 "All-same-size datasets: padding_mask must be all-True"
         finally:
             os.unlink(pkl2)
+
+
+# ---------------------------------------------------------------------------
+# Tree-based training tests
+# ---------------------------------------------------------------------------
+
+def _make_base_config_tree(env: str, n_beams: int = 2, n_parallel: int = 2):
+    """Return a minimal config for tree_based training tests."""
+    cfg = _make_base_config(env, n_beams=n_beams, n_parallel=n_parallel)
+    # tree_based training requires non-stable_baselines compatibility
+    cfg['system']['compatibility_mode'] = None
+    cfg['train']['method'] = 'tree_based'
+    cfg['train']['n_beams'] = n_beams
+    cfg['muzero']['max_moves'] = 100
+    cfg['muzero']['data_steps_per_epoch'] = n_parallel
+    return cfg
+
+
+class TestTreeBasedTrainingVRPTW:
+    """Tests for the tree_based training path with VRPTW."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.vrptw import VRPTW
+        self.VRPTW = VRPTW
+        self.pkl = _make_vrptw_dataset(n_problems=4, n_nodes=6)
+        config = _make_base_config_tree('vrptw', n_beams=2, n_parallel=2)
+        config['eval']['data_file'] = self.pkl
+        self.config = config
+        yield
+        os.unlink(self.pkl)
+
+    def test_verify_consistent_config_sets_compatibility(self):
+        """verify_consistent_config should set compatibility_mode=None for tree_based."""
+        import yaml
+        from earli.utils.nv import verify_consistent_config
+
+        cfg = _make_base_config_tree('vrptw', n_beams=2, n_parallel=2)
+        # Simulate misconfigured: stable_baselines with tree_based
+        cfg['system']['compatibility_mode'] = 'stable_baselines'
+        cfg2 = verify_consistent_config(cfg, warn=False)
+        assert cfg2['system']['compatibility_mode'] is None, (
+            "verify_consistent_config should override compatibility_mode to None "
+            "for tree_based training"
+        )
+
+    def test_train_method_not_overridden_by_train_py(self):
+        """The train.py module must NOT force method='ppo'."""
+        import ast
+        import inspect
+        from earli import train as train_module
+
+        source = inspect.getsource(train_module)
+        tree = ast.parse(source)
+
+        # Walk the AST looking for assignments that match
+        # config['train']['method'] = 'ppo'  (with a string literal rhs).
+        forced_ppo_assignments = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            # Check RHS is the string 'ppo'
+            if not (isinstance(node.value, ast.Constant)
+                    and node.value.value == 'ppo'):
+                continue
+            # Check LHS is a subscript chain: config['train']['method']
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value == 'method'):
+                    forced_ppo_assignments.append(node)
+
+        assert not forced_ppo_assignments, (
+            "train.py must not have an unconditional assignment "
+            "config['train']['method'] = 'ppo'; tree_based method must be respected."
+        )
+
+    def test_play_game_training_returns_training_data(self):
+        """SelfPlay.play_game(training=True) should return a non-empty training_data."""
+        from earli.self_play import SelfPlay
+        from earli.models.attention_model import PosAttentionModel
+        from earli.models.sampler import Sampler
+
+        config = self.config
+        sampler = Sampler(config)
+        env = self.VRPTW(config, datafile=self.pkl, env_type='train')
+        obs_space, act_space = env.spaces
+        model = PosAttentionModel(obs_space, act_space, config=config, sampler=sampler)
+
+        collector = SelfPlay(
+            Game=self.VRPTW,
+            config=config,
+            seed=0,
+            env_type='train',
+            n_beams=config['train']['n_beams'],
+            model=model,
+            datafile=self.pkl,
+            n_problems=config['train']['n_parallel_problems'],
+        )
+
+        _, infos = collector.play_game(deterministic=False, training=True)
+        assert 'training_data' in infos, "training_data must be present in infos"
+        td = infos['training_data']
+        assert len(td) > 0, "training_data must be non-empty"
+        for key in ('observations', 'actions', 'log_prob', 'rewards', 'returns'):
+            assert key in td.keys(), f"training_data must contain key '{key}'"
+
+    def test_ppo_update_runs_without_error(self):
+        """_ppo_update must run one gradient step without errors."""
+        from earli.self_play import SelfPlay
+        from earli.models.attention_model import PosAttentionModel
+        from earli.models.sampler import Sampler
+        from earli.train import _ppo_update
+
+        config = self.config
+        sampler = Sampler(config)
+        env = self.VRPTW(config, datafile=self.pkl, env_type='train')
+        obs_space, act_space = env.spaces
+        model = PosAttentionModel(obs_space, act_space, config=config, sampler=sampler)
+
+        collector = SelfPlay(
+            Game=self.VRPTW,
+            config=config,
+            seed=0,
+            env_type='train',
+            n_beams=config['train']['n_beams'],
+            model=model,
+            datafile=self.pkl,
+            n_problems=config['train']['n_parallel_problems'],
+        )
+
+        _, infos = collector.play_game(deterministic=False, training=True)
+        td = infos['training_data']
+        if len(td) == 0:
+            pytest.skip("No training data collected (degenerate game)")
+
+        # Should not raise
+        _ppo_update(model, td, config, n_epochs=1)
+
+
+class TestTreeBasedTrainingPDPTW:
+    """Tests for the tree_based training path with PDPTW."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.pdptw import PDPTW
+        self.PDPTW = PDPTW
+        self.pkl = _make_pdptw_dataset(n_problems=4, n_nodes=7)
+        config = _make_base_config_tree('pdptw', n_beams=2, n_parallel=2)
+        config['eval']['data_file'] = self.pkl
+        self.config = config
+        yield
+        os.unlink(self.pkl)
+
+    def test_play_game_training_returns_training_data(self):
+        """SelfPlay.play_game(training=True) should return non-empty data for PDPTW."""
+        from earli.self_play import SelfPlay
+        from earli.models.attention_model import PosAttentionModel
+        from earli.models.sampler import Sampler
+
+        config = self.config
+        sampler = Sampler(config)
+        env = self.PDPTW(config, datafile=self.pkl, env_type='train')
+        obs_space, act_space = env.spaces
+        model = PosAttentionModel(obs_space, act_space, config=config, sampler=sampler)
+
+        collector = SelfPlay(
+            Game=self.PDPTW,
+            config=config,
+            seed=0,
+            env_type='train',
+            n_beams=config['train']['n_beams'],
+            model=model,
+            datafile=self.pkl,
+            n_problems=config['train']['n_parallel_problems'],
+        )
+
+        _, infos = collector.play_game(deterministic=False, training=True)
+        assert 'training_data' in infos, "training_data must be present in infos for PDPTW"
+        td = infos['training_data']
+        assert len(td) > 0, "training_data must be non-empty for PDPTW"
+
+    def test_ppo_update_runs_for_pdptw(self):
+        """_ppo_update must run one gradient step for PDPTW without errors."""
+        from earli.self_play import SelfPlay
+        from earli.models.attention_model import PosAttentionModel
+        from earli.models.sampler import Sampler
+        from earli.train import _ppo_update
+
+        config = self.config
+        sampler = Sampler(config)
+        env = self.PDPTW(config, datafile=self.pkl, env_type='train')
+        obs_space, act_space = env.spaces
+        model = PosAttentionModel(obs_space, act_space, config=config, sampler=sampler)
+
+        collector = SelfPlay(
+            Game=self.PDPTW,
+            config=config,
+            seed=0,
+            env_type='train',
+            n_beams=config['train']['n_beams'],
+            model=model,
+            datafile=self.pkl,
+            n_problems=config['train']['n_parallel_problems'],
+        )
+
+        _, infos = collector.play_game(deterministic=False, training=True)
+        td = infos['training_data']
+        if len(td) == 0:
+            pytest.skip("No training data collected (degenerate game)")
+
+        _ppo_update(model, td, config, n_epochs=1)

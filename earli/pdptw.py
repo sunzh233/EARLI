@@ -254,7 +254,15 @@ class PDPTW(VRPTW):
         demand_removed = demand[dummy_ind, visit_site]
         demand[dummy_ind, visit_site] = 0
         capacity -= demand_removed
-        capacity[depot_visit] = 1.0 if self.normalize else self.max_capacity[depot_visit].clone()
+        # Expand max_capacity to (n_problems * n_beams,) so the mask aligns.
+        if self.extended_output_format:
+            max_cap_expanded = (self.max_capacity
+                                .unsqueeze(1)
+                                .expand(self.n_parallel_problems, self.n_beams)
+                                .reshape(-1))
+        else:
+            max_cap_expanded = self.max_capacity
+        capacity[depot_visit] = 1.0 if self.normalize else max_cap_expanded[depot_visit].clone()
 
         self.non_zero_demand = self.demand > 0
 

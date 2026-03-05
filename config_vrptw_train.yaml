@@ -10,10 +10,14 @@ system:
   allow_wandb: False
   run_name: null
   no_sweep: False
-  compatibility_mode: stable_baselines  # required for PPO; set null for tree_based
+  # compatibility_mode must be null for tree_based training (tensors required).
+  # Set to stable_baselines when using method: ppo.
+  compatibility_mode: null
 
 train:
-  # Set method to 'ppo' for PPO pipeline or 'tree_based' for tree-based MCTS pipeline
+  # tree_based: tree-search guided PPO (higher data quality, recommended).
+  #   Requires compatibility_mode: null and n_beams >= 2.
+  # ppo: Stable-Baselines3 PPO (simpler, requires compatibility_mode: stable_baselines).
   method: 'tree_based'
   optimizer: 'adam'
   seed: 0
@@ -23,7 +27,7 @@ train:
   block_decreasing_action: False
   epochs: 100
   batch_size: 512
-  n_beams: 1           # use 1 for PPO; >=2 for tree_based
+  n_beams: 4           # >= 2 enables true tree search; 1 degenerates to single-beam rollout
   pretrained_fname: null
   pretrained_run: null
   save_model_path: 'earli/pretrained_models/model_vrptw.m'
