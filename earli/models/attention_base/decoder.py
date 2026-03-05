@@ -75,8 +75,12 @@ class AutoregressiveDecoder(nn.Module):
         self.config = config
         self.separate_head_and_action_model = config['attention_model']['separate_head_and_action_model']
         assert embedding_dim % num_heads == 0
-        self.context_and_head_embedding = nn.Linear(2 * embedding_dim + (8 if self.eight_rounding else 3),
-                                                        2 * embedding_dim, bias=linear_bias)
+        # For VRPTW/PDPTW we include current_time as an extra global dynamic feature
+        # (1 scalar in addition to capacity, remaining_demand, remaining_nodes).
+        _n_dynamic = 4 if env_name in ('vrptw', 'pdptw') else 3
+        self.context_and_head_embedding = nn.Linear(
+            2 * embedding_dim + (8 if self.eight_rounding else _n_dynamic),
+            2 * embedding_dim, bias=linear_bias)
         # MHA
         self.logit_attention = LogitAttention(
                 embedding_dim, num_heads, **logit_attn_kwargs
@@ -233,6 +237,14 @@ class AutoregressiveDecoder(nn.Module):
             if self.eight_rounding:
                 dynamic_features = torch.cat((td['capacity'][:, 0], td['remaining_demand'][:, 0], td['remaining_nodes'][:, 0],
                                               torch.zeros([len(td), 5], device='cuda')), dim=-1)  # padding to 8 to use TC
+            elif self.env_name in ('vrptw', 'pdptw') and 'current_time' in td.keys():
+                # Include normalised current time as an additional global dynamic feature
+                # so the decoder can reason about time-window urgency at each step.
+                dynamic_features = torch.cat(
+                    (td['capacity'][:, 0], td['remaining_demand'][:, 0],
+                     td['remaining_nodes'][:, 0], td['current_time'][:, 0]),
+                    dim=-1,
+                )
             else:
                 dynamic_features = torch.cat((td['capacity'][:, 0], td['remaining_demand'][:, 0], td['remaining_nodes'][:, 0]),
                                              dim=-1)

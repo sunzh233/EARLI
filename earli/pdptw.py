@@ -341,6 +341,12 @@ class PDPTW(VRPTW):
 
         extra = {'is_pickup': is_pick, 'is_delivery': is_delv, 'pickup_done': pdone}
         if self.config['system']['use_tensordict']:
+            # VRPTW.get_pos_representation() already moved obs to CPU when
+            # save_obs_on_gpu=False.  The PDPTW-specific tensors are still on
+            # self.device (GPU), so we must bring them to the same device as obs
+            # before assigning, to avoid a TensorDict mixed-device error.
+            if not self.config['system']['save_obs_on_gpu']:
+                extra = {k: v.cpu() for k, v in extra.items()}
             for k, v in extra.items():
                 obs[k] = v
         else:

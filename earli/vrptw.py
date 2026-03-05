@@ -79,16 +79,26 @@ class VRPTW(VRP):
         if not self.stable_baselines_compatibility:
             self.observation_space = Dict({
                 **self.observation_space.spaces,
-                'tmin': Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                'tmax': Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                'dt'  : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'tmin'        : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'tmax'        : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'dt'          : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                # Dynamic time features (updated every step):
+                # time_slack: remaining time until each node's deadline from current time,
+                #             normalised by the planning horizon. Conveys urgency.
+                'time_slack'  : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                # current_time: normalised elapsed time for the current vehicle route.
+                #               Broadcast to all nodes so the decoder can use it as a
+                #               global context scalar.
+                'current_time': Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
             })
         else:
             self.observation_space = Dict({
                 **self.observation_space.spaces,
-                'tmin': Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                'tmax': Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                'dt'  : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'tmin'        : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'tmax'        : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'dt'          : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'time_slack'  : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'current_time': Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
             })
 
         # Extend terminal state
@@ -274,16 +284,43 @@ class VRPTW(VRP):
         tw = self.ref_time_windows[indices]         # (n, n_nodes, 2)
         svc = self.ref_service_times[indices]       # (n, n_nodes)
         horizon = tw[..., 1].max(dim=-1, keepdim=True).values.clamp(min=1.0)  # (n, 1)
+
+        # Fetch current time before extending tw/horizon so shapes are consistent.
+        # current_time: (n, n_beams, 1) in extended format; (n, 1) otherwise.
+        ct = self.current_time[indices]
+
         if self.extended_output_format:
             tw = tw.unsqueeze(1).expand(*batch_dim, self.problem_size, 2).contiguous()
             svc = svc.unsqueeze(1)
-            horizon = horizon.unsqueeze(1)
+            horizon = horizon.unsqueeze(1)   # (n, 1, 1)
 
-        tmin = (tw[..., 0:1] / horizon.unsqueeze(-1))   # (batch, n_nodes, 1)
+        # Static TW features (normalised by horizon)
+        tmin = (tw[..., 0:1] / horizon.unsqueeze(-1))   # (*batch_dim, n_nodes, 1)
         tmax = (tw[..., 1:2] / horizon.unsqueeze(-1))
         dt   = tmax - tmin
 
-        tw_obs = {'tmin': tmin, 'tmax': tmax, 'dt': dt}
+        # Dynamic feature: remaining time until each node's deadline from the current
+        # vehicle position, normalised by the planning horizon.
+        # due shape: (*batch_dim, n_nodes); ct shape: (n,[n_beams,] 1);
+        # horizon shape: (n,[1,] 1) – all broadcast correctly via PyTorch rules.
+        due = tw[..., 1]                                              # (*batch_dim, n_nodes)
+        time_slack = ((due - ct) / horizon).clamp(min=0).unsqueeze(-1)  # (*batch_dim, n_nodes, 1)
+
+        # Global context: current (elapsed) time normalised by horizon, broadcast to
+        # all nodes so the decoder can use it as a per-env scalar.
+        ct_norm = ct / horizon                                         # (n, [n_beams,] 1)
+        current_time_feat = (ct_norm
+                             .unsqueeze(-2)
+                             .expand(*batch_dim, self.problem_size, 1)
+                             .contiguous())                            # (*batch_dim, n_nodes, 1)
+
+        tw_obs = {
+            'tmin'        : tmin,
+            'tmax'        : tmax,
+            'dt'          : dt,
+            'time_slack'  : time_slack,
+            'current_time': current_time_feat,
+        }
 
         if self.config['system']['use_tensordict']:
             for k, v in tw_obs.items():

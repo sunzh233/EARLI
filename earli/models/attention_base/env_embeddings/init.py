@@ -69,8 +69,8 @@ class VRPInitEmbedding(nn.Module):
             if eight_rounding:
                 node_dim = 16
             else:
-                node_dim += 3
-            self.node_features += ('tmin', 'tmax', 'dt')  # +Padded to 16 to use TC
+                node_dim += 4  # +tmin, +tmax, +dt, +time_slack (dynamic urgency feature)
+            self.node_features += ('tmin', 'tmax', 'dt', 'time_slack')  # +Padded to 16 to use TC
         if env_type == 'pdptw':
             # Additional pair-awareness features: is_pickup, is_delivery, pickup_done
             node_dim += 3
