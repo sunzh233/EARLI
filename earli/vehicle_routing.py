@@ -239,9 +239,26 @@ class RoutingBase(GymEnv, VecEnv):
         self.reset_dynamic_properties(indices, n_problems_to_reset)
         state = self.get_pos_representation(indices=indices)
         if self.stable_baselines_compatibility:
-            state = state.squeeze(1).to_dict()
-        if self.gym_format: #convert from TensorDict to dict, and from torch to numpy
-            state = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in state.to_dict().items()}
+            # get_pos_representation may return a TensorDict (when use_tensordict=True)
+            # or a plain dict (when use_tensordict=False). Handle both.
+            try:
+                from tensordict import TensorDict as _TD
+            except Exception:
+                _TD = None
+
+            if _TD is not None and isinstance(state, _TD):
+                state = state.squeeze(1).to_dict()
+            # If state is a plain dict, leave tensor shapes intact. The original
+            # implementation assumed a TensorDict and squeezed the batch dimension
+            # at the TensorDict level; performing per-tensor squeeze here can
+            # remove internal singleton dims (e.g. attention channels) and break
+            # downstream attention masks. So do nothing for plain dicts.
+        if self.gym_format: #convert from TensorDict or dict to numpy dict
+            if hasattr(state, 'to_dict'):
+                state_dict = state.to_dict()
+            else:
+                state_dict = state
+            state = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
             return state, {}
         else:
             return state
@@ -297,8 +314,18 @@ class RoutingBase(GymEnv, VecEnv):
 
     def step(self, action, automatic_reset=True, **kwargs):
         obs, buf_rews, buf_dones, buf_infos = self._step(action, **kwargs)
+        # Robustly handle different tensor/array types for stable-baselines compatibility
         if self.stable_baselines_compatibility:
-            buf_dones = buf_dones.squeeze(1).cpu().numpy()
+            # Normalize buf_dones to a 1D numpy boolean array of length num_envs
+            if isinstance(buf_dones, torch.Tensor):
+                buf_dones = buf_dones.squeeze(1).cpu().numpy() if buf_dones.dim() > 1 else buf_dones.cpu().numpy()
+            elif isinstance(buf_dones, np.ndarray):
+                buf_dones = np.squeeze(buf_dones, axis=1) if buf_dones.ndim > 1 else buf_dones
+            else:
+                try:
+                    buf_dones = np.array(buf_dones)
+                except Exception:
+                    pass
         # save final observation where user can get it, then reset
         if buf_dones.any() and automatic_reset:
             new_obs = self.reset(buf_dones)
@@ -309,18 +336,80 @@ class RoutingBase(GymEnv, VecEnv):
             infos = deepcopy(buf_infos)
 
         if self.stable_baselines_compatibility:
-            buf_rews = buf_rews.squeeze(1)
-            # convert from TensorDict to dict, and from torch to numpy
-            obs = obs.squeeze(1).to_dict()
+            # Normalize buffer rewards to numpy 1D
+            if isinstance(buf_rews, torch.Tensor):
+                buf_rews = buf_rews.squeeze(1).cpu().numpy() if buf_rews.dim() > 1 else buf_rews.cpu().numpy()
+            elif isinstance(buf_rews, np.ndarray):
+                buf_rews = np.squeeze(buf_rews, axis=1) if buf_rews.ndim > 1 else buf_rews
+            else:
+                try:
+                    buf_rews = np.array(buf_rews)
+                except Exception:
+                    pass
+
+            # Convert obs to a plain dict of numpy arrays (expected by SB3)
+            if hasattr(obs, 'squeeze') and hasattr(obs, 'to_dict'):
+                # TensorDict path
+                obs_td = obs.squeeze(1).to_dict()
+            elif isinstance(obs, dict):
+                obs_td = obs
+            else:
+                obs_td = obs
+
+            # Convert tensor values to numpy arrays where necessary
+            obs_dict = {}
+            if isinstance(obs_td, dict):
+                for k, v in obs_td.items():
+                    if isinstance(v, torch.Tensor):
+                        obs_dict[k] = v.cpu().numpy()
+                    else:
+                        obs_dict[k] = v
+            else:
+                obs_dict = obs_td
+
+            obs = obs_dict
+
             sb_info = [{} for _ in range(self.num_envs)]
-            for i in range(self.num_envs):
-                sb_info[i].update({k: v[i] for k, v in infos.items()})
-                sb_info[i].update({'episode': None, 'is_success': None})
+            # `infos` may be a dict of per-key arrays (original code) or a
+            # list of per-env dicts (e.g., when we filled with placeholders).
+            if isinstance(infos, dict):
+                for i in range(self.num_envs):
+                    sb_info[i].update({k: (v[i] if (isinstance(v, (list, tuple, np.ndarray)) or isinstance(v, torch.Tensor)) else v)
+                                        for k, v in infos.items()})
+                    sb_info[i].update({'episode': None, 'is_success': None})
+            elif isinstance(infos, list):
+                for i in range(self.num_envs):
+                    if isinstance(infos[i], dict):
+                        sb_info[i].update(infos[i])
+                    sb_info[i].update({'episode': None, 'is_success': None})
+            else:
+                for i in range(self.num_envs):
+                    sb_info[i].update({'episode': None, 'is_success': None})
             infos = sb_info
         if self.gym_format:
-            obs = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in obs.to_dict().items()}
-            buf_rews = buf_rews.cpu().numpy()
-            buf_dones = buf_dones.cpu().numpy()
+            # obs may be a TensorDict or a plain dict
+            if hasattr(obs, 'to_dict'):
+                state_dict = obs.to_dict()
+            else:
+                state_dict = obs
+            obs = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+
+            if isinstance(buf_rews, torch.Tensor):
+                buf_rews = buf_rews.cpu().numpy()
+            elif not isinstance(buf_rews, np.ndarray):
+                try:
+                    buf_rews = np.array(buf_rews)
+                except Exception:
+                    pass
+
+            if isinstance(buf_dones, torch.Tensor):
+                buf_dones = buf_dones.cpu().numpy()
+            elif not isinstance(buf_dones, np.ndarray):
+                try:
+                    buf_dones = np.array(buf_dones)
+                except Exception:
+                    pass
+
             # new gym standard: obs, rewards, terminated, truncated, infos
             return obs, buf_rews, buf_dones, np.zeros_like(buf_dones), infos
         else:

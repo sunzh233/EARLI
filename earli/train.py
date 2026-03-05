@@ -90,7 +90,8 @@ def train(config_path: str, total_steps: int | None = None) -> None:
         policy_kwargs={'config': config},
         n_steps=n_steps,
         batch_size=config['train']['batch_size'],
-        learning_rate=config['train']['learning_rate'],
+        learning_rate=(config['train']['learning_rate'] if callable(config['train']['learning_rate'])
+                       else float(config['train']['learning_rate'])),
         ent_coef=0,
         verbose=1,
     )
