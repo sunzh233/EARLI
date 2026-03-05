@@ -682,6 +682,36 @@ class TestPDPTW:
         assert torch.allclose(time_slack, tmax, atol=1e-5), \
             'At reset, PDPTW time_slack should equal tmax (current_time=0)'
 
+    def test_obs_all_keys_on_same_device_after_step(self):
+        """All observation tensors must be on the same device after a step.
+
+        This guards against the bug where VRPTW.get_pos_representation() moved
+        obs to CPU (save_obs_on_gpu=False) but PDPTW then added its own tensors
+        (is_pickup, is_delivery, pickup_done) without moving them first, causing
+        a TensorDict mixed-device error when env_device='cuda'.
+        """
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        env._step(actions)
+        obs = env.get_pos_representation()
+
+        # All required PDPTW keys must be present
+        expected_keys = (
+            'demand', 'feasible_nodes', 'head',
+            'tmin', 'tmax', 'dt', 'time_slack', 'current_time',
+            'is_pickup', 'is_delivery', 'pickup_done',
+        )
+        for key in expected_keys:
+            assert key in obs, f"Key '{key}' missing from PDPTW observation after step"
+
+        # All tensors must be on the same device (no mixed CPU/GPU)
+        devices = {key: obs[key].device for key in expected_keys}
+        unique_devices = set(str(d) for d in devices.values())
+        assert len(unique_devices) == 1, (
+            f'All observation tensors must be on the same device, got: {devices}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mixed-size data training tests
