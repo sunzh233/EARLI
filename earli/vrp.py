@@ -69,6 +69,13 @@ class VRP(RoutingBase):
         self.capacity = torch.zeros(size=self.maybe_extend([self.n_parallel_problems, 1]), device=self.device)
         # nodes with non zero demand (dynamic)
         self.non_zero_demand = torch.ones_like(self.feasible_nodes)
+        # padding_mask: True for real nodes, False for padding nodes injected
+        # when training with problems of mixed sizes.  Initialised to all-True
+        # (no padding) and updated in reset_static_properties.
+        self.padding_mask = torch.ones(
+            self.maybe_extend([self.n_parallel_problems, self.problem_size]),
+            dtype=torch.bool, device=self.device,
+        )
         self.action_space = Discrete(self.problem_size)
         # self.filter_action_for_masked_sites = False
         self.normalize = self.config['representation']['normalize']
@@ -152,6 +159,10 @@ class VRP(RoutingBase):
         self.feasible_nodes[indices, ..., DEPOT_LOCATION] = False
         # reset and normalize demand
         self.non_zero_demand[indices] = self.feasible_nodes[indices].clone()  # same value
+        # Apply padding mask: padding nodes (from mixed-size training) are never
+        # feasible and carry no demand, so they should never be selected.
+        self.feasible_nodes[indices] &= self.padding_mask[indices]
+        self.non_zero_demand[indices] &= self.padding_mask[indices]
         # first index is the accumalted return in this environment, second index is the minimal accumlated return in all environments
         self.acc_returns[indices] = 0
 
@@ -211,6 +222,14 @@ class VRP(RoutingBase):
             if self.config['representation']['normalize_pos_obs_like_reward']:
                 self.pos[indices] = self.pos[indices] * self.reward_normalization
             self.distance_matrix[indices] = self.distance_matrix[indices] * self.reward_normalization
+        # Update padding_mask for the active environments.
+        # For mixed-size training, valid_mask_ref marks real nodes (True) vs
+        # padding nodes (False).  Padding nodes have zero demand and will be
+        # masked out during reset_dynamic_properties so they are never selected.
+        vm = self.valid_mask_ref[fixed_dataset_indices].to(self.device)
+        if self.extended_output_format:
+            vm = vm.unsqueeze(1).expand_as(self.padding_mask[indices])
+        self.padding_mask[indices] = vm
         return n_problems_to_reset
 
     def _step(self, actions, calc_obs=True):

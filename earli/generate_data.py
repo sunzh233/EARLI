@@ -203,3 +203,154 @@ class ProblemLoader(object):
 #          generate_time_windows, create_dataset, is_better
 # Removed: get_num_carriers_candidates, convert_cuopt_solution, test_cuopt_solution
 # Removed global constants related to data generation
+
+
+def _pad_dataset(data: dict, max_size: int) -> dict:
+    """Pad all node-indexed tensor fields in *data* so the node dimension equals *max_size*.
+
+    A ``valid_mask`` boolean tensor of shape ``(n_problems, max_size)`` is added
+    where ``True`` marks real nodes and ``False`` marks padding slots.
+
+    Args:
+        data: Dataset dict as returned by :meth:`ProblemLoader.load_problem_data`.
+        max_size: Target number of nodes (must be >= current size).
+
+    Returns:
+        A new dict with all node-level tensors padded to *max_size*.
+    """
+    n, cur_size = data['positions'].shape[:2]
+    pad = max_size - cur_size
+
+    result = dict(data)
+
+    # valid_mask: True for real nodes, False for padding
+    valid_mask = torch.zeros(n, max_size, dtype=torch.bool)
+    valid_mask[:, :cur_size] = True
+    result['valid_mask'] = valid_mask
+
+    if pad == 0:
+        return result
+
+    def _pad2d(t):
+        """(n, cur_size) -> (n, max_size)"""
+        return torch.cat([t, torch.zeros(n, pad, dtype=t.dtype)], dim=1)
+
+    def _pad3d(t):
+        """(n, cur_size, k) -> (n, max_size, k)"""
+        k = t.shape[2]
+        return torch.cat([t, torch.zeros(n, pad, k, dtype=t.dtype)], dim=1)
+
+    def _pad_dm(t):
+        """(n, cur_size, cur_size) -> (n, max_size, max_size)"""
+        t = torch.cat([t, torch.zeros(n, cur_size, pad, dtype=t.dtype)], dim=2)
+        return torch.cat([t, torch.zeros(n, pad, max_size, dtype=t.dtype)], dim=1)
+
+    result['positions'] = _pad3d(data['positions'])
+    result['demand'] = _pad2d(data['demand'])
+    result['distance_matrix'] = _pad_dm(data['distance_matrix'])
+
+    if 'time_windows' in data:
+        result['time_windows'] = _pad3d(data['time_windows'])
+    if 'service_times' in data:
+        result['service_times'] = _pad2d(data['service_times'])
+    # 'pairs' indices reference original node IDs -- no padding needed
+    return result
+
+
+def _merge_datasets(datasets: list) -> dict:
+    """Concatenate a list of (same max-size) datasets along the problem axis.
+
+    Tensor fields are concatenated; scalar / non-tensor fields are taken from
+    the first dataset.  ``n_problems`` is updated to the total count.
+
+    Args:
+        datasets: List of data dicts with identical node-dimension sizes.
+
+    Returns:
+        A single merged data dict.
+    """
+    if len(datasets) == 1:
+        return datasets[0]
+
+    result = {}
+    keys = set(datasets[0].keys())
+    for k in keys:
+        v0 = datasets[0].get(k)
+        if v0 is None:
+            continue
+        if isinstance(v0, torch.Tensor) and v0.dim() > 0:
+            try:
+                result[k] = torch.cat([d[k] for d in datasets if k in d], dim=0)
+            except Exception:
+                result[k] = v0
+        elif isinstance(v0, np.ndarray):
+            result[k] = np.concatenate([d[k] for d in datasets if k in d], axis=0)
+        else:
+            result[k] = v0  # scalar: keep first dataset's value
+
+    result['n_problems'] = sum(d['n_problems'] for d in datasets)
+    # Re-generate contiguous IDs for the merged dataset
+    result['id'] = np.arange(result['n_problems'])
+    return result
+
+
+class MultiSizeDataLoader:
+    """Loads and merges problem datasets of potentially different problem sizes.
+
+    When datasets have different numbers of nodes, all problems are padded to
+    the maximum size.  A boolean ``valid_mask`` tensor of shape
+    ``(n_total_problems, max_size)`` is added to the merged dataset, where
+    ``True`` marks real nodes and ``False`` marks padding slots.
+
+    The padding approach allows a single environment instance (with a fixed
+    ``problem_size = max_size``) to train on problems of mixed sizes within the
+    same training run.  Padding nodes carry zero demand and are kept
+    infeasible throughout the episode, so they are never selected as actions.
+
+    Example usage (config)::
+
+        eval:
+          data_files:
+            - datasets/vrp_50.pkl
+            - datasets/vrp_100.pkl
+            - datasets/vrp_200.pkl
+
+    The environment reads ``data_files`` (list) when present; otherwise it
+    falls back to the single ``data_file`` string.
+    """
+
+    @staticmethod
+    def load_mixed_data(config, fnames: list, problem_range: list = None) -> dict:
+        """Load and merge multiple pkl dataset files, padding to the largest size.
+
+        Args:
+            config: Main configuration dictionary (passed through to
+                :meth:`ProblemLoader.load_problem_data`).
+            fnames: Ordered list of paths to ``.pkl`` dataset files.
+            problem_range: Optional ``[start, end]`` slice applied to each
+                dataset independently.
+
+        Returns:
+            A merged data dict where every problem has the same node count
+            (``max_size`` across all loaded files).  An extra ``valid_mask``
+            field ``(n_total, max_size)`` bool tensor is included.
+        """
+        if not fnames:
+            raise ValueError("fnames must contain at least one file path.")
+
+        datasets = [
+            ProblemLoader.load_problem_data(config=config, fname=fname,
+                                            problem_range=problem_range)
+            for fname in fnames
+        ]
+
+        if len(datasets) == 1:
+            d = datasets[0]
+            n, s = d['positions'].shape[:2]
+            if 'valid_mask' not in d:
+                d['valid_mask'] = torch.ones(n, s, dtype=torch.bool)
+            return d
+
+        max_size = max(d['positions'].shape[1] for d in datasets)
+        padded = [_pad_dataset(d, max_size) for d in datasets]
+        return _merge_datasets(padded)
