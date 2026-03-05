@@ -473,6 +473,50 @@ class TestVRPTW:
         assert (env.current_time == 0.0).all(), \
             'Current time should be 0 after returning to depot'
 
+    def test_time_slack_in_observation(self):
+        """time_slack must be non-negative and equal max(0, tmax - current_time/horizon)."""
+        env = self._make_env()
+        obs = env.reset()
+        assert 'time_slack' in obs, "'time_slack' must be present in VRPTW observation"
+        assert 'current_time' in obs, "'current_time' must be present in VRPTW observation"
+
+        time_slack = obs['time_slack'].float()
+        tmax = obs['tmax'].float()
+        current_time_feat = obs['current_time'].float()
+
+        # All values non-negative
+        assert (time_slack >= 0).all(), 'time_slack must be >= 0'
+        assert (current_time_feat >= 0).all(), 'current_time feature must be >= 0'
+
+        # At reset, current_time=0 so time_slack should equal tmax
+        assert torch.allclose(time_slack, tmax, atol=1e-5), \
+            'At reset (current_time=0), time_slack should equal tmax (= due/horizon)'
+
+        # current_time feature is 0 at reset
+        assert (current_time_feat == 0).all(), \
+            'current_time feature must be 0 right after reset'
+
+    def test_time_slack_decreases_after_step(self):
+        """time_slack must decrease (or stay) for nodes after a step advances the clock."""
+        env = self._make_env()
+        env.reset()
+        obs_before = env.get_pos_representation()
+        slack_before = obs_before['time_slack'].float()
+
+        # Visit node 1 → clock advances
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        _, _, dones, _ = env._step(actions)
+
+        obs_after = env.get_pos_representation()
+        slack_after = obs_after['time_slack'].float()
+        ct_after = obs_after['current_time'].float()
+
+        # time_slack must not increase (clock only moves forward)
+        assert (slack_after <= slack_before + 1e-5).all(), \
+            'time_slack should not increase after a step advances current_time'
+        # current_time feature must be >= 0
+        assert (ct_after >= 0).all(), 'current_time feature must remain >= 0 after a step'
+
     def test_tw_infeasible_node_blocked(self):
         """A node whose due-date has already passed must be excluded from feasible_nodes."""
         import pickle as pkl_mod
@@ -618,6 +662,25 @@ class TestPDPTW:
         env._step(actions)
         assert (env.current_time >= time_before).all(), \
             'Current time should not decrease after a step'
+
+    def test_time_slack_and_current_time_in_observation(self):
+        """PDPTW observation must include time_slack and current_time features."""
+        env = self._make_env()
+        obs = env.reset()
+        assert 'time_slack' in obs, "'time_slack' must be in PDPTW observation"
+        assert 'current_time' in obs, "'current_time' must be in PDPTW observation"
+
+        time_slack = obs['time_slack'].float()
+        tmax = obs['tmax'].float()
+        current_time_feat = obs['current_time'].float()
+
+        # All non-negative
+        assert (time_slack >= 0).all(), 'time_slack must be >= 0'
+        assert (current_time_feat >= 0).all(), 'current_time feature must be >= 0'
+
+        # At reset current_time=0, so time_slack == tmax
+        assert torch.allclose(time_slack, tmax, atol=1e-5), \
+            'At reset, PDPTW time_slack should equal tmax (current_time=0)'
 
 
 # ---------------------------------------------------------------------------
