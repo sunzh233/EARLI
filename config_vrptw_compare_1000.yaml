@@ -1,0 +1,71 @@
+# cuOpt comparison config for VRPTW n=1000 instances: cuOpt baseline vs cuOpt+RL.
+# Runs both methods at total time budgets of 20s and 60s.
+# For cuOpt_RL the RL inference time (injection.rl_runtime) is subtracted from
+# the solver time budget so that both methods use the same total wall time.
+# injection.rl_runtime is patched at runtime by run.sh after measuring inference.
+system:
+  env_device: cpu
+  model_device: cuda
+  tree_device: cpu
+  save_obs_on_gpu: True
+  use_tensordict: True
+  allow_wandb: False
+  wandb_user: null
+  wandb_project: null
+  run_name: null
+  no_sweep: False
+
+speedups:
+  use_fabric: False
+
+names:
+  run_title: 'compare_vrptw_1000'
+  # cuOpt       : pure cuOpt, no RL initialisation (baseline)
+  # cuOpt_RL    : cuOpt seeded with RL solutions; rl_runtime is subtracted from solver time
+  methods: ['cuOpt', 'cuOpt_RL']
+  baseline: cuOpt
+  main_method: cuOpt_RL
+  verbose: 2
+
+paths:
+  # PKL dataset file (produced by benchmark_parser.py)
+  problems: datasets/vrptw_1000.pkl
+  # RL inference log file – set at runtime via --solutions argument to cuopt_injection_vrptw
+  solutions: null
+  solutions_source: null
+  naive_source: null
+  out_summary: compare_vrptw_1000
+
+problem:
+  env: vrptw
+  problems_range: null
+  last_return_to_depot: True
+  remove_last_depot_from_solution: True
+
+cuopt:
+  # Total time budgets for the comparison: 20 s and 60 s
+  runtimes: [20.0, 60.0]
+  fixed_vehicles: True
+  spare_vehicles: 0
+  use_reference_for_num_vehicles: False
+  normalization: null
+  pull_freq: 0
+  repetitions: 1
+
+injection:
+  max_injections: null
+  can_choose_injections: False
+  post_ls_solutions: 1
+  both_rl_and_naive: 0
+  avoid_suboptimal: True
+  sort: cost
+  n_naives: 1
+  use_greedy: True
+  # rl_runtime: per-problem RL inference time (seconds).
+  # Patched at runtime by run.sh; set to 0 as a safe fallback.
+  rl_runtime: 0
+  naive_runtime: 0
+
+logger:
+  logging_level: 20
+  post_analysis: 0

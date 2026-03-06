@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+import argparse
 import yaml
 from matplotlib import pyplot as plt
 from yaml import SafeLoader
@@ -23,7 +24,17 @@ ENV_CLASSES = {
 }
 
 
-def main(config_path='config.yaml'):
+def main(config_path=None):
+    if config_path is None:
+        parser = argparse.ArgumentParser(
+            description='Run RL inference for VRP/VRPTW/PDPTW.'
+        )
+        parser.add_argument(
+            '--config', default='config.yaml',
+            help='Path to the YAML config file (default: config.yaml)',
+        )
+        args = parser.parse_args()
+        config_path = args.config
     with open(config_path) as f:
         config = yaml.load(f, Loader=SafeLoader)
     config = verify_consistent_config(config)
