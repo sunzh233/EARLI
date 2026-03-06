@@ -17,6 +17,7 @@ from .unified_logger import UnifiedLogger
 
 import cuopt
 from .cuopt_solver.cuopt_solver import CuOptSolver
+import torch
 
 import wandb
 from .utils import analysis_utils as utils
@@ -28,7 +29,8 @@ def load_problems(problems_path, problems_range, config):
     with open(problems_path, 'rb') as hh:
         problems = pkl.load(hh)
     problem_size = problems['distance_matrix'].shape[-1]
-    radius = np.max(np.abs(problems['positions']))
+    # ensure positions are numpy array (pickle may contain torch tensors)
+    radius = np.max(np.abs(_as_numpy(problems['positions'])))
     if config['cuopt']['normalization'] is None:
         config['cuopt']['normalization'] = np.sqrt(radius)
     CUOPT_NORMALIZATION = config['cuopt']['normalization']
@@ -54,6 +56,22 @@ def load_problems(problems_path, problems_range, config):
     n_problems = problems_range[1] - problems_range[0]
     print(f'Problems: {problems_range[0]}-{problems_range[1]-1}')
     return problems, problems_range, problem_size, n_problems, CUOPT_NORMALIZATION, LP
+
+
+def _as_numpy(x):
+    """Safely convert possible torch tensors to numpy arrays.
+    If x is a torch tensor, move to CPU then convert; otherwise use np.asarray.
+    This prevents numpy calling torch.sum with numpy-style kwargs.
+    """
+    try:
+        if 'torch' in str(type(x)):
+            try:
+                return x.cpu().numpy()
+            except Exception:
+                return np.asarray(x)
+        return np.asarray(x)
+    except Exception:
+        return np.asarray(x)
 
 
 def download_wandb_file(run, user, project, filename='test_logs.pkl'):
@@ -187,7 +205,14 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
     external_solutions = []
     extra_time_needed = 0
     if 'RL' in method:
-        external_solutions = rlopt_solutions[method][ind]
+        # defensive: rlopt_solutions may not contain the requested method
+        method_sols = rlopt_solutions.get(method) if isinstance(rlopt_solutions, dict) else None
+        if method_sols is None:
+            print(f"Warning: RL solutions for method {method} not found. No solutions will be injected.")
+            external_solutions = []
+        else:
+            # method_sols is expected to be a list indexed by problem
+            external_solutions = method_sols[ind] if ind < len(method_sols) else []
         if force_feasible:
             external_solutions = [sol for sol in external_solutions if eval_utils.verify_solution(
                 sol, problems['demand'][ind], problems['capacity'][ind].item(), n_carriers)]
@@ -200,7 +225,7 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
             else:
                 best_cars = np.min([np.sum(np.array(sol[:-1]) == 0) for sol in external_solutions])
                 is_optimal_cars = best_cars == (n_carriers if USE_REF_VEHICLES else (
-                        np.sum(problems['demand'][ind]) / int(np.ceil(problems['capacity'][ind]))))
+                    np.sum(_as_numpy(problems['demand'][ind])) / int(np.ceil(problems['capacity'][ind]))))
                 add_naive = not is_optimal_cars
         if add_naive:
             extra_time_needed = NAIVE_RUNTIME
@@ -222,7 +247,7 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
         if USE_REF_VEHICLES:
             optimal_cars = n_carriers
         elif ENV == 'vrp':
-            optimal_cars = int(np.ceil(np.sum(problems['demand'][ind]) / np.ceil(problems['capacity'][ind])))
+            optimal_cars = int(np.ceil(np.sum(_as_numpy(problems['demand'][ind])) / np.ceil(problems['capacity'][ind])))
         else:
             optimal_cars = np.min(sols_cars)
         external_solutions = [sol for sol, cars in zip(external_solutions, sols_cars)
@@ -284,7 +309,7 @@ def get_num_carriers_candidates(tot_demand, max_capacity, margin=1):
 def optimality_guarantee(sol, problems, i_problem):
     if problems['env_type'] != 'vrp':
         return False
-    optimal_cars = int(np.ceil(np.sum(problems['demand']) / np.ceil(problems['capacity'])))
+    optimal_cars = int(np.ceil(np.sum(_as_numpy(problems['demand'])) / np.ceil(problems['capacity'])))
     optimal_cars_in_problem = optimal_cars[i_problem]
     sol_cars = np.sum(np.array(sol[0]) == 0) - 1
     if sol_cars < optimal_cars_in_problem:
@@ -322,7 +347,7 @@ def pre_stats_rlopt_vs_cuopt(problems, rlopt_solutions, LP=2):
     print(f'\nn_vehicles(rlopt) - n_vehicles(cuopt, {cuopt_time:d}s):', collections.Counter(rlopt_extra_cars))
 
     if problems['env_type'] == 'vrp':
-        lower_bound_cars = int(np.ceil(np.sum(problems['demand']) / np.ceil(problems['capacity'])))
+        lower_bound_cars = int(np.ceil(np.sum(_as_numpy(problems['demand'])) / np.ceil(problems['capacity'])))
         bound_extra_cars = [rl - lb for rl, lb in zip(rlopt_cars, lower_bound_cars)]
         print(f'\nn_vehicles(rlopt) - lower_bound:', collections.Counter(bound_extra_cars))
         rlopt_optimality_guarantee = np.mean(np.array(bound_extra_cars) == 0)
@@ -473,6 +498,93 @@ def run_initialization_only(external_solutions, best_cars, best_cost, method):
     num_iterations = 0
     return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations
 
+
+def _to_float(x):
+    if x is None:
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    try:
+        return float(x.item())
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return np.nan
+
+
+def _extract_route(sol):
+    if sol is None or len(sol) == 0:
+        return []
+    if isinstance(sol, (tuple, list)) and len(sol) == 2 and isinstance(sol[1], list):
+        return sol[1]
+    return sol
+
+
+def _format_route(route, max_nodes=24):
+    if route is None or len(route) == 0:
+        return "[]"
+    if len(route) <= max_nodes:
+        return str(route)
+    n_head = max(1, max_nodes // 2)
+    n_tail = max(1, max_nodes - n_head)
+    head = route[:n_head]
+    tail = route[-n_tail:]
+    return f"{head} ... {tail} (len={len(route)})"
+
+
+def print_live_problem_log(
+        method, solver_time, problem_id, repetition,
+        init_runtime, ga_time,
+        external_solutions, best_cars, best_cost,
+        accepted, success, success2, vehicle_count, cost, final_solution,
+        route_nodes=24):
+    ext_routes = [_extract_route(sol) for sol in external_solutions]
+    ext_preview = _format_route(ext_routes[0], route_nodes) if ext_routes else "[]"
+    final_preview = _format_route(final_solution, route_nodes)
+    accepted_count = int((accepted == 1).astype(int).sum()) if len(accepted) else 0
+    rejected_count = int((accepted == 0).astype(int).sum()) if len(accepted) else 0
+    unconsidered_count = int((accepted == -1).astype(int).sum()) if len(accepted) else 0
+    is_rl_method = 'RL' in method
+
+    if is_rl_method:
+        print(
+            f"[live] t={solver_time:.3f}s p={problem_id} rep={repetition} method={method} "
+            f"init={init_runtime:.3f}s ga={ga_time:.3f}s "
+            f"inject_n={len(external_solutions)} accepted={accepted_count} rejected={rejected_count} "
+            f"unconsidered={unconsidered_count} inj_best_veh={_to_float(best_cars):.0f} "
+            f"inj_best_cost={_to_float(best_cost):.3f} final_success={bool(success)} "
+            f"verify_success={bool(success2)} final_veh={_to_float(vehicle_count):.0f} "
+            f"final_cost={_to_float(cost):.3f}"
+        )
+        print(f"       injected_route: {ext_preview}")
+        print(f"       final_route   : {final_preview}")
+    else:
+        print(
+            f"[live] t={solver_time:.3f}s p={problem_id} rep={repetition} method={method} "
+            f"init={init_runtime:.3f}s ga={ga_time:.3f}s final_success={bool(success)} "
+            f"verify_success={bool(success2)} final_veh={_to_float(vehicle_count):.0f} "
+            f"final_cost={_to_float(cost):.3f}"
+        )
+        print(f"       final_route   : {final_preview}")
+
+
+def print_live_pairwise_comparison(solver_time, problem_id, repetition, baseline_item, main_item):
+    base_cost = _to_float(baseline_item['cost'])
+    main_cost = _to_float(main_item['cost'])
+    base_veh = _to_float(baseline_item['vehicles'])
+    main_veh = _to_float(main_item['vehicles'])
+    cost_delta = main_cost - base_cost if np.isfinite(base_cost) and np.isfinite(main_cost) else np.nan
+    veh_delta = main_veh - base_veh if np.isfinite(base_veh) and np.isfinite(main_veh) else np.nan
+    print(
+        f"[live-compare] t={solver_time:.3f}s p={problem_id} rep={repetition} "
+        f"baseline({baseline_item['method']}) success={bool(baseline_item['success2'])} "
+        f"veh={base_veh:.0f} cost={base_cost:.3f} | "
+        f"main({main_item['method']}) success={bool(main_item['success2'])} "
+        f"veh={main_veh:.0f} cost={main_cost:.3f} | "
+        f"delta(main-baseline): veh={veh_delta:.0f}, cost={cost_delta:.3f}"
+    )
+
 def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind, ga_time, ENV, LAST_RETURN_TO_DEPOT, FIXED_VEHICLES, PULL_FREQ, CUOPT_NORMALIZATION):
     # construct cuopt solver
     cuopt_config = dict(
@@ -491,21 +603,115 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
 
     distance_matrix = problems['distance_matrix'][ind]
     capacity = problems['capacity'][ind]
-    problem = solver.create_data_model(
-        demand=demands_for_solver,
-        distance_matrix=distance_matrix / CUOPT_NORMALIZATION,
-        vehicle_capacity=np.full(shape=(n_carriers,),
-                                 fill_value=capacity,
-                                 dtype=int),
-        n_carriers=n_carriers, set_fixed_carriers=FIXED_VEHICLES,
-        last_drop_return_trip=not cuopt_config['problem_setup']['last_return_to_depot'],
-        injected_solutions=external_solutions)
+    # defensive: validate inputs before calling cuOpt
+    # distance_matrix
+    if distance_matrix is None:
+        warnings.warn(f'distance_matrix is None for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    try:
+        dm = np.asarray(distance_matrix)
+    except Exception:
+        warnings.warn(f'Invalid distance_matrix for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    if dm.ndim < 2 or dm.shape[0] < 2:
+        warnings.warn(f'distance_matrix shape invalid for problem {ind}: {getattr(dm, "shape", None)}')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+
+    # capacity
+    if capacity is None:
+        warnings.warn(f'capacity is None for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+
+    # demands
+    if demands_for_solver is None:
+        warnings.warn(f'demands_for_solver is None for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    try:
+        dem = _as_numpy(demands_for_solver)
+    except Exception:
+        warnings.warn(f'Invalid demands_for_solver for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    if dem.shape[0] != dm.shape[0]:
+        warnings.warn(f'demands length {dem.shape[0]} does not match distance_matrix size {dm.shape[0]} for problem {ind}; skipping')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+
+    # n_carriers
+    try:
+        n_carriers = int(n_carriers)
+        if n_carriers <= 0:
+            warnings.warn(f'n_carriers <= 0 for problem {ind}; skipping cuOpt run')
+            return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    except Exception:
+        warnings.warn(f'Invalid n_carriers for problem {ind}; skipping cuOpt run')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+
+    # ensure external_solutions is a list and filter-out invalid entries
+    if external_solutions is None:
+        external_solutions = []
+    else:
+        try:
+            external_solutions = [es for es in external_solutions if es is not None]
+        except Exception:
+            external_solutions = []
+
+    try:
+        # ensure distance_matrix is numpy to avoid numpy.sum calling torch.sum
+        if 'torch' in str(type(distance_matrix)):
+            try:
+                distance_np = distance_matrix.cpu().numpy()
+            except Exception:
+                distance_np = np.asarray(distance_matrix)
+        else:
+            distance_np = np.asarray(distance_matrix)
+
+            # print(f"Creating cuOpt data model for problem {ind} with {n_carriers} carriers and {len(external_solutions)} external solutions...")
+            # print(f"{type(distance_np)=}, {getattr(distance_np, 'shape', None)=}, {type(demands_for_solver)=}, {getattr(demands_for_solver, 'shape', None)=}, {type(n_carriers)=}, {n_carriers=}, last_return_to_depot={cuopt_config['problem_setup']['last_return_to_depot']}, fixed_vehicles={FIXED_VEHICLES}, external_solutions_count={len(external_solutions)}")
+
+        # Convert demands to numpy array (create_data_model expects array-like for demand)
+        try:
+            demand_arr = _as_numpy(demands_for_solver)
+        except Exception:
+            demand_arr = np.array(demands_for_solver)
+
+        # Extract time windows and service times for VRPTW if present
+        t_min = None
+        t_max = None
+        dt = None
+        if problems is not None and 'time_windows' in problems:
+            tw = problems['time_windows'][ind]
+            tw = _as_numpy(tw)
+            # tw shape expected (n_nodes, 2)
+            if tw.ndim == 2 and tw.shape[1] >= 2:
+                t_min = tw[:, 0].astype(float)
+                t_max = tw[:, 1].astype(float)
+        if problems is not None and 'service_times' in problems:
+            svc = problems['service_times'][ind]
+            dt = _as_numpy(svc).astype(float)
+
+        problem = solver.create_data_model(
+            demand=demand_arr,
+            distance_matrix=distance_np / CUOPT_NORMALIZATION,
+            vehicle_capacity=np.full(shape=(n_carriers,),
+                                     fill_value=int(capacity),
+                                     dtype=int),
+            n_carriers=n_carriers, set_fixed_carriers=FIXED_VEHICLES,
+            last_drop_return_trip=not cuopt_config['problem_setup']['last_return_to_depot'],
+            injected_solutions=external_solutions,
+            t_min=t_min, t_max=t_max, dt=dt)
+    except Exception as e:
+        warnings.warn(f'Failed to create cuOpt data model for problem {ind}: {e}')
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+    
+    print(f"Problem {ind}: demand sum={np.sum(_as_numpy(problems['demand'][ind]))} capacity={capacity} n_carriers={n_carriers} ")
 
     # run cuopt solver
     t0 = time.time()
     try:
         routing_solution, populations = solver.solve(problem, verbose=0)
         actual_runtime = time.time() - t0
+        if routing_solution is None:
+            warnings.warn(f'cuOpt returned None routing_solution for problem {ind}')
+            return False, np.nan, np.nan, [], pd.Series(dtype='float'), actual_runtime, np.nan, None
         success = routing_solution.get_status() == 0
         vehicle_count = routing_solution.get_vehicle_count()
         cost = CUOPT_NORMALIZATION * routing_solution.get_total_objective()
@@ -519,12 +725,12 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
         populations = None
 
     num_iterations = np.nan
-
+    print(f"cuOpt finished for problem {ind} with success={success}, vehicles={vehicle_count}, cost={cost:.3f}, runtime={actual_runtime:.2f}s, accepted_solutions={len(accepted)}")
     if populations is not None:
-        populations.update_costs(distance_matrix=distance_matrix, capacity=capacity,
-                                 demands_for_solver=demands_for_solver, n_customers=distance_matrix.shape[0] - 1,
+        populations.update_costs(distance_matrix=distance_np, capacity=capacity,
+                                 demands_for_solver=demand_arr, n_customers=distance_np.shape[0] - 1,
                                  return_to_depot=cuopt_config['problem_setup']['last_return_to_depot'])
-
+    print(f"Returning from run_cuopt for problem {ind} with success={success}, vehicles={vehicle_count}, cost={cost:.3f}, runtime={actual_runtime:.2f}s, accepted_solutions={len(accepted)}")
     return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations
 
 
@@ -582,6 +788,8 @@ def main(config_path='config_initialization.yaml'):
     AVOID_SUBOPTIMAL_CARS = config['injection']['avoid_suboptimal']
     SORT_SOLUTIONS = config['injection']['sort']
     REPETITIONS = config['cuopt']['repetitions']
+    LIVE_LOG_PER_PROBLEM = bool(config['injection'].get('log_per_problem', False))
+    LIVE_LOG_ROUTE_NODES = int(config['injection'].get('log_route_nodes', 24))
 
     ENV = config['problem']['env']
     LAST_RETURN_TO_DEPOT = config['problem']['last_return_to_depot']
@@ -643,6 +851,7 @@ def main(config_path='config_initialization.yaml'):
     successes = []
     successes2 = []
     runtimes = []
+    live_compare_buffer = {}
 
     pool_methods, pool_full_times, pool_times, pool_problems, pool_sizes, pool_vehicles, pool_costs = \
         [], [], [], [], [], [], []
@@ -658,7 +867,7 @@ def main(config_path='config_initialization.yaml'):
 
                 # extract instance data
                 demands_for_solver = problems['demand'][ind]
-                tot_demand = np.sum(demands_for_solver)
+                tot_demand = np.sum(_as_numpy(demands_for_solver))
                 max_capacity = problems['capacity'][ind]
                 if USE_REF_VEHICLES:
                     n_carriers = problems['baseline_vehicles'][ind].item() + SPARE_VEHICLES
@@ -667,6 +876,7 @@ def main(config_path='config_initialization.yaml'):
                         tot_demand, max_capacity, margin=0 if FIXED_VEHICLES else SPARE_VEHICLES)
 
                 avoid_suboptimal_cars = AVOID_SUBOPTIMAL_CARS
+                print(f"\nRunning {method} on problem {ind} with time budget {solver_time:.1f}s (init {init_runtime:.1f}s, GA {ga_time:.1f}s), ")
                 external_solutions, best_cars, best_cost, extra_time_needed = preprocess_external_solutions(
                     method, ind, problems, n_carriers, rlopt_solutions, naive_solutions, problems_range, avoid_suboptimal_cars=avoid_suboptimal_cars, force_feasible=ga_time == 0, LP=LP,
                     BOTH_RL_AND_NAIVE=BOTH_RL_AND_NAIVE, NAIVE_RUNTIME=NAIVE_RUNTIME, USE_REF_VEHICLES=USE_REF_VEHICLES, ENV=ENV, SORT_SOLUTIONS=SORT_SOLUTIONS,
@@ -685,21 +895,47 @@ def main(config_path='config_initialization.yaml'):
                             external_solutions, best_cars, best_cost, method)
 
                     else:
+                        print(f"Running solver with GA time {ga_time:.1f}s (init time {init_runtime:.1f}s) on problem {ind} with method {method} ")
                         # CASE II: cuOpt
+                        # For cuOpt_RL: print how many external (injected) solutions we will pass
+                        try:
+                            ext_n = len(external_solutions) if external_solutions is not None else 0
+                        except Exception:
+                            ext_n = 0
+                        if 'cuOpt' in method and 'RL' in method:
+                            # compute best injected solution cost (if any)
+                            try:
+                                ext_routes = [_extract_route(es) for es in (external_solutions or [])]
+                                ext_costs = [eval_utils.solution_cost(r, problems['distance_matrix'][ind], LP)
+                                             for r in ext_routes if r]
+                                ext_vehs = [int(np.sum(np.array(r[:-1]) == 0)) for r in ext_routes if r]
+                                if len(ext_costs) > 0:
+                                    idx = int(np.argmin(ext_costs))
+                                    inj_best_cost = float(ext_costs[idx])
+                                    inj_best_veh = int(ext_vehs[idx]) if idx < len(ext_vehs) else np.nan
+                                else:
+                                    inj_best_cost = np.nan
+                                    inj_best_veh = np.nan
+                            except Exception:
+                                inj_best_cost = np.nan
+                                inj_best_veh = np.nan
+                            print(f"[inject] method={method} problem={ind} injecting_solutions={ext_n} inj_best_cost={inj_best_cost:.3f} inj_best_veh={inj_best_veh}")
+
                         success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations = \
                             run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind, ga_time, ENV, LAST_RETURN_TO_DEPOT, FIXED_VEHICLES, PULL_FREQ, CUOPT_NORMALIZATION)
 
                     # re-verify solution
                     if success:
                         success2 = eval_utils.verify_solution(
-                            solution, demands_for_solver, max_capacity.item(), n_carriers, True, print)
+                            solution, _as_numpy(demands_for_solver), max_capacity.item(), n_carriers, True, print)
+                        # print(f"Verified solution for problem {ind} with method {method}: success={success2}")
                         if not success2:
                             print(f'Solution validation failed ({solver_time}, {ind}, {method}).')
                     else:
                         # if first indicator is failure - don't trust verifier to work properly, and default to False.
                         try:
                             success2 = eval_utils.verify_solution(
-                                solution, demands_for_solver, max_capacity.item(), n_carriers, False)
+                                solution, _as_numpy(demands_for_solver), max_capacity.item(), n_carriers, False)
                         except:
                             success2 = False
 
@@ -725,6 +961,45 @@ def main(config_path='config_initialization.yaml'):
                     solutions[f'time_{solver_time:.0f}_problem_{ind:d}_{method:s}_iter_{repetition:d}'] = solution
                     if solver_stats is not None:
                         stats[f'time_{solver_time:.0f}_problem_{ind:d}_{method:s}_iter_{repetition:d}'] = solver_stats
+
+                    if LIVE_LOG_PER_PROBLEM:
+                        print_live_problem_log(
+                            method=method,
+                            solver_time=solver_time,
+                            problem_id=problem_id,
+                            repetition=repetition,
+                            init_runtime=init_runtime,
+                            ga_time=ga_time,
+                            external_solutions=external_solutions,
+                            best_cars=best_cars,
+                            best_cost=best_cost,
+                            accepted=accepted,
+                            success=success,
+                            success2=success2,
+                            vehicle_count=vehicle_count,
+                            cost=cost,
+                            final_solution=solution,
+                            route_nodes=LIVE_LOG_ROUTE_NODES,
+                        )
+
+                        key = (solver_time, ind, repetition)
+                        if key not in live_compare_buffer:
+                            live_compare_buffer[key] = {}
+                        live_compare_buffer[key][method] = dict(
+                            method=method,
+                            success2=success2,
+                            vehicles=vehicle_count,
+                            cost=cost,
+                        )
+                        if BASELINE in live_compare_buffer[key] and MAIN_METHOD in live_compare_buffer[key]:
+                            print_live_pairwise_comparison(
+                                solver_time=solver_time,
+                                problem_id=problem_id,
+                                repetition=repetition,
+                                baseline_item=live_compare_buffer[key][BASELINE],
+                                main_item=live_compare_buffer[key][MAIN_METHOD],
+                            )
+                            del live_compare_buffer[key]
 
                     # update pool results
                     if PULL_FREQ > 0 and method.startswith('cuOpt'):

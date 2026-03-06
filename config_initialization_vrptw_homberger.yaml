@@ -1,0 +1,61 @@
+---
+system:
+  env_device: cpu
+  model_device: cuda
+  tree_device: cpu
+  save_obs_on_gpu: true
+  use_tensordict: true
+  allow_wandb: false
+  wandb_user: nvr-israel
+  wandb_project: RLOptimizer
+  run_name: null
+  no_sweep: false
+
+speedups:
+  use_fabric: false
+
+names:
+  run_title: "injection_vrptw_homberger"
+  methods: ["cuOpt", "cuOpt_RL"]
+  baseline: cuOpt
+  main_method: cuOpt_RL
+  verbose: 2
+
+paths:
+  problems: datasets/homberger_vrptw_curriculum/vrptw_test_1000.pkl
+  solutions: outputs/test_logs.pkl
+  solutions_source: null
+  naive_source: null
+  out_summary: test_summary_vrptw_homberger
+
+problem:
+  env: vrptw
+  problems_range: null
+  last_return_to_depot: true
+  remove_last_depot_from_solution: true
+
+cuopt:
+  runtimes: [15, 30, 60]
+  fixed_vehicles: true
+  spare_vehicles: 1000
+  use_reference_for_num_vehicles: false
+  normalization: null
+  pull_freq: 0
+  repetitions: 1
+
+injection:
+  max_injections: 16
+  can_choose_injections: false
+  post_ls_solutions: 1
+  both_rl_and_naive: 0
+  avoid_suboptimal: false
+  sort: cost
+  n_naives: 1
+  rl_runtime: null
+  naive_runtime: 0
+  log_per_problem: true
+  log_route_nodes: 24
+
+logger:
+  logging_level: 20
+  post_analysis: 0

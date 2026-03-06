@@ -156,7 +156,8 @@ def evaluate_populations_gaps(data):
 
             # log worst solution in population
             problem_ids.append(i_prob)
-            worst_cost = np.max(population_costs)
+            # ensure we operate on numpy array (items may be torch tensors)
+            worst_cost = np.max(np.asarray(population_costs))
             times.append(t)
             gaps.append(worst_cost / final_cost)
             criterion.append('worst')
@@ -165,7 +166,8 @@ def evaluate_populations_gaps(data):
 
             # log best solution in population
             problem_ids.append(i_prob)
-            best_cost = np.min(population_costs)
+            # ensure we operate on numpy array (items may be torch tensors)
+            best_cost = np.min(np.asarray(population_costs))
             times.append(t)
             gaps.append(best_cost / final_cost)
             criterion.append('best')

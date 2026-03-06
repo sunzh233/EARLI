@@ -59,16 +59,16 @@ for SIZE in 200 400; do
 done
 
 # --- PDPTW training data (Li&Lim, n <= 500) ---
-for SIZE in 100 200 400; do
-    PKL="datasets/pdptw_${SIZE}.pkl"
-    DIR="li&lim benchmark/pdp_${SIZE}"
-    if [[ ! -f "$PKL" ]]; then
-        echo "  Parsing PDPTW n=${SIZE} → $PKL"
-        python -m earli.benchmark_parser pdptw "$DIR" "$PKL"
-    else
-        echo "  $PKL already exists, skipping."
-    fi
-done
+# for SIZE in 100 200 400; do
+#     PKL="datasets/pdptw_${SIZE}.pkl"
+#     DIR="li&lim benchmark/pdp_${SIZE}"
+#     if [[ ! -f "$PKL" ]]; then
+#         echo "  Parsing PDPTW n=${SIZE} → $PKL"
+#         python -m earli.benchmark_parser pdptw "$DIR" "$PKL"
+#     else
+#         echo "  $PKL already exists, skipping."
+#     fi
+# done
 
 # --- VRPTW test data (Homberger n=1000) ---
 if [[ ! -f "datasets/vrptw_1000.pkl" ]]; then
@@ -81,16 +81,16 @@ else
 fi
 
 # --- PDPTW test data (Li&Lim n=1000) ---
-if [[ ! -f "datasets/pdptw_1000.pkl" ]]; then
-    echo "  Parsing PDPTW n=1000 → datasets/pdptw_1000.pkl"
-    python -m earli.benchmark_parser pdptw \
-        "li&lim benchmark/pdptw1000" \
-        datasets/pdptw_1000.pkl
-else
-    echo "  datasets/pdptw_1000.pkl already exists, skipping."
-fi
+# if [[ ! -f "datasets/pdptw_1000.pkl" ]]; then
+#     echo "  Parsing PDPTW n=1000 → datasets/pdptw_1000.pkl"
+#     python -m earli.benchmark_parser pdptw \
+#         "li&lim benchmark/pdptw1000" \
+#         datasets/pdptw_1000.pkl
+# else
+#     echo "  datasets/pdptw_1000.pkl already exists, skipping."
+# fi
 
-echo ""
+# echo ""
 
 # ---------------------------------------------------------------------------
 # STEP 2 – Train RL models
@@ -101,9 +101,9 @@ echo ""
 echo "  Training VRPTW model ..."
 python -m earli.train --config "config_vrptw_${PIPELINE}_train_mixed.yaml"
 
-echo ""
-echo "  Training PDPTW model ..."
-python -m earli.train --config "config_pdptw_${PIPELINE}_train_mixed.yaml"
+# echo ""
+# echo "  Training PDPTW model ..."
+# python -m earli.train --config "config_pdptw_${PIPELINE}_train_mixed.yaml"
 
 echo ""
 
@@ -133,24 +133,24 @@ PYEOF
 echo "  VRPTW RL inference time per problem: ${VRPTW_RL_TIME} s"
 
 # -- PDPTW --
-echo "  PDPTW n=1000 inference ..."
-python -m earli.main --config "config_pdptw_infer_1000_${PIPELINE}.yaml"
-cp outputs/test_logs.pkl outputs/pdptw_1000_rl_solutions.pkl
+# echo "  PDPTW n=1000 inference ..."
+# python -m earli.main --config "config_pdptw_infer_1000_${PIPELINE}.yaml"
+# cp outputs/test_logs.pkl outputs/pdptw_1000_rl_solutions.pkl
 
-PDPTW_RL_TIME=$(python - <<'PYEOF'
-import pickle, sys
-try:
-    with open('outputs/pdptw_1000_rl_solutions.pkl', 'rb') as f:
-        stats = pickle.load(f)
-    t = float(stats.get('game_clocktime', 0))
-    print(f'{t:.4f}')
-except Exception as e:
-    print('0.0', file=sys.stderr)
-    print('0.0')
-PYEOF
-)
-echo "  PDPTW RL inference time per problem: ${PDPTW_RL_TIME} s"
-echo ""
+# PDPTW_RL_TIME=$(python - <<'PYEOF'
+# import pickle, sys
+# try:
+#     with open('outputs/pdptw_1000_rl_solutions.pkl', 'rb') as f:
+#         stats = pickle.load(f)
+#     t = float(stats.get('game_clocktime', 0))
+#     print(f'{t:.4f}')
+# except Exception as e:
+#     print('0.0', file=sys.stderr)
+#     print('0.0')
+# PYEOF
+# )
+# echo "  PDPTW RL inference time per problem: ${PDPTW_RL_TIME} s"
+# echo ""
 
 # ---------------------------------------------------------------------------
 # STEP 4 – cuOpt vs cuOpt+RL comparison experiments (requires cuOpt)
@@ -173,10 +173,10 @@ if ! python -c "import cuopt" 2>/dev/null; then
     echo "    python -m earli.cuopt_injection_vrptw \\"
     echo "        --config /tmp/config_vrptw_compare_1000_runtime.yaml \\"
     echo "        --solutions outputs/vrptw_1000_rl_solutions.pkl"
-    echo "    # earli.cuopt_injection_vrptw also handles PDPTW via config problem.env:"
-    echo "    python -m earli.cuopt_injection_vrptw \\"
-    echo "        --config /tmp/config_pdptw_compare_1000_runtime.yaml \\"
-    echo "        --solutions outputs/pdptw_1000_rl_solutions.pkl"
+    # echo "    # earli.cuopt_injection_vrptw also handles PDPTW via config problem.env:"
+    # echo "    python -m earli.cuopt_injection_vrptw \\"
+    # echo "        --config /tmp/config_pdptw_compare_1000_runtime.yaml \\"
+    # echo "        --solutions outputs/pdptw_1000_rl_solutions.pkl"
     exit 0
 fi
 
@@ -208,12 +208,12 @@ PYEOF
 
 patch_and_run vrptw "${VRPTW_RL_TIME}" outputs/vrptw_1000_rl_solutions.pkl
 echo ""
-patch_and_run pdptw "${PDPTW_RL_TIME}" outputs/pdptw_1000_rl_solutions.pkl
+# patch_and_run pdptw "${PDPTW_RL_TIME}" outputs/pdptw_1000_rl_solutions.pkl
 
 echo ""
 echo "============================================================"
 echo "  All done!"
 echo "  Experiment results saved to ./outputs/"
 echo "    VRPTW: outputs/compare_vrptw_1000_compare_vrptw_1000.pkl"
-echo "    PDPTW: outputs/compare_pdptw_1000_compare_pdptw_1000.pkl"
+# echo "    PDPTW: outputs/compare_pdptw_1000_compare_pdptw_1000.pkl"
 echo "============================================================"

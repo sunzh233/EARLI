@@ -282,7 +282,21 @@ def _train_ppo(config, env_class, datafile, total_steps):
     env_name = config['problem_setup']['env'].upper()
     env      = env_class(config, datafile=datafile, env_type='train')
 
-    n_steps = max(1, total_steps // config['train']['n_parallel_problems'])
+    # Keep rollout horizon independent from total_steps so changing total_steps
+    # increases the number of PPO rollouts/iterations instead of only enlarging
+    # a single rollout. Priority:
+    #   1) train.n_steps (if explicitly provided in config)
+    #   2) muzero.data_steps_per_epoch / n_parallel_problems
+    #   3) fallback to 1
+    n_parallel = max(1, int(config['train']['n_parallel_problems']))
+    cfg_n_steps = config['train'].get('n_steps')
+    if cfg_n_steps is not None:
+        n_steps = max(1, int(cfg_n_steps))
+    else:
+        per_epoch_steps = int(config['muzero']['data_steps_per_epoch'])
+        n_steps = max(1, per_epoch_steps // n_parallel)
+
+    rollout_size = n_steps * n_parallel
 
     sb3_model = PPO(
         policy=PosAttentionModel,
@@ -302,7 +316,8 @@ def _train_ppo(config, env_class, datafile, total_steps):
     print(
         f"[ppo] Training {env_name} for {total_steps} steps "
         f"({config['train']['epochs']} epochs × "
-        f"{config['muzero']['data_steps_per_epoch']} data steps/epoch) …"
+        f"{config['muzero']['data_steps_per_epoch']} data steps/epoch, "
+        f"n_steps={n_steps}, n_parallel={n_parallel}, rollout_size={rollout_size}) …"
     )
     sb3_model.learn(total_steps, log_interval=1)
 

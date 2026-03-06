@@ -83,6 +83,9 @@ class Evaluator(object):
             if key == 'train':
                 continue
             n_parallel = min(self.config['train']['n_parallel_problems'], n_problem)
+            if n_problem % n_parallel != 0:
+                n_parallel = n_problem // (n_problem // self.config['train']['n_parallel_problems'])
+                print(f'Warning: Adjusting n_parallel_problems for stage {key} to {n_parallel} to fit the dataset size.')
             assert n_problem % n_parallel == 0, \
                 f'The number of {key} problems ({n_problem}) must be divisible by n_parallel_problems ({n_parallel}).'
             n_data_collection_iterations = n_problem // n_parallel
@@ -300,10 +303,34 @@ class Evaluator(object):
             demands = env.data['demand'][ind].tolist()
             capacity = env.data['capacity'][ind].item()
 
+            # HGS can fail (e.g., NULL pointer access) for malformed candidates.
+            # Filter invalid routes before invoking HGS and gracefully fall back.
+            valid_sols = [
+                sol for sol in sols
+                if evaluation_utils.verify_solution(sol, np.array(demands), capacity, max_vehicles=None)
+            ]
+            if len(valid_sols) == 0:
+                if verbose >= 1:
+                    warnings.warn(
+                        f'Local-search skipped for problem {ind}: no valid candidate solutions.'
+                    )
+                ls_sols.append([])
+                ls_times.append(0.0)
+                continue
+
             # apply ls
             t0 = time.time()
-            ls_sol, vehc2, cost2 = HGS.local_search(sols, distance_matrix, demands, capacity,
-                                                    solver=solver)
+            try:
+                ls_sol, vehc2, cost2 = HGS.local_search(
+                    valid_sols, distance_matrix, demands, capacity, solver=solver
+                )
+            except Exception as exc:
+                if verbose >= 1:
+                    warnings.warn(
+                        f'Local-search failed for problem {ind} ({type(exc).__name__}: {exc}). '
+                        f'Using original valid solutions without local-search.'
+                    )
+                ls_sol = valid_sols
             ls_times.append(time.time() - t0)
 
             if verify_valid_solutions:
@@ -314,7 +341,7 @@ class Evaluator(object):
 
             ls_sols.append(ls_sol)
 
-        if verbose >= 1:
+        if verbose >= 1 and n_problems > 0:
             print(f'\nLocal-search duration per problem (for {len(sols)} solutions): '
                   f'{np.mean(ls_times)} +- {np.std(ls_times)/np.sqrt(n_problems)} [s]')
 
