@@ -25,6 +25,7 @@ def env_init_embedding(env_name: str, config: dict) -> nn.Module:
         "dpp"   : DPPInitEmbedding,
         "mdpp"  : MDPPInitEmbedding,
         "pdp"   : PDPInitEmbedding,
+        "pdptw" : PDPInitEmbedding,
         "mtsp"  : MTSPInitEmbedding,
         "smtwtp": SMTWTPInitEmbedding,
         }
@@ -225,20 +226,62 @@ class PDPInitEmbedding(nn.Module):
            Note that pickups and deliveries are interleaved in the input.
     """
 
-    def __init__(self, embedding_dim, linear_bias=True):
+    def __init__(self, embedding_dim, linear_bias=True, env_type='pdp', eight_rounding=False):
         super(PDPInitEmbedding, self).__init__()
-        node_dim = 2  # x, y
-        self.init_embed_depot = nn.Linear(2, embedding_dim, linear_bias)
-        self.init_embed_pick = nn.Linear(node_dim * 2, embedding_dim, linear_bias)
-        self.init_embed_delivery = nn.Linear(node_dim, embedding_dim, linear_bias)
+        # eight_rounding parameter is kept for API compatibility but not used in PDP
+        node_dim_depot = 2  # x, y for depot
+        node_dim_pick = 4  # x, y of pickup and delivery
+        node_dim_delivery = 2  # x, y
+        
+        # Add time window support for PDPTW
+        if env_type == 'pdptw':
+            # Add tmin, tmax, dt (time windows) for PDPTW
+            node_dim_depot += 3
+            node_dim_pick += 6  # 3 for pickup, 3 for delivery
+            node_dim_delivery += 3
+            
+        self.init_embed_depot = nn.Linear(node_dim_depot, embedding_dim, linear_bias)
+        self.init_embed_pick = nn.Linear(node_dim_pick, embedding_dim, linear_bias)
+        self.init_embed_delivery = nn.Linear(node_dim_delivery, embedding_dim, linear_bias)
+        self.env_type = env_type
 
     def forward(self, td):
         depot, locs = td["locs"][..., 0:1, :], td["locs"][..., 1:, :]
         num_locs = locs.size(-2)
+        
+        # Concatenate pickup and delivery location features
         pick_feats = torch.cat(
                 [locs[:, : num_locs // 2, :], locs[:, num_locs // 2:, :]], -1
                 )  # [batch_size, graph_size//2, 4]
         delivery_feats = locs[:, num_locs // 2:, :]  # [batch_size, graph_size//2, 2]
+        
+        # Add time window features for PDPTW
+        if self.env_type == 'pdptw':
+            # Depot time windows
+            depot_time_feats = torch.cat([
+                td["tmin"][..., 0:1, :], 
+                td["tmax"][..., 0:1, :], 
+                td["dt"][..., 0:1, :]
+            ], -1)
+            depot = torch.cat([depot, depot_time_feats], -1)
+            
+            # Pickup time windows
+            pick_time_feats = torch.cat([
+                td["tmin"][..., 1:num_locs // 2 + 1, :],
+                td["tmax"][..., 1:num_locs // 2 + 1, :],
+                td["dt"][..., 1:num_locs // 2 + 1, :]
+            ], -1)
+            
+            # Delivery time windows
+            delivery_time_feats = torch.cat([
+                td["tmin"][..., num_locs // 2 + 1:, :],
+                td["tmax"][..., num_locs // 2 + 1:, :],
+                td["dt"][..., num_locs // 2 + 1:, :]
+            ], -1)
+            
+            pick_feats = torch.cat([pick_feats, pick_time_feats, delivery_time_feats], -1)
+            delivery_feats = torch.cat([delivery_feats, delivery_time_feats], -1)
+        
         depot_embeddings = self.init_embed_depot(depot)
         pick_embeddings = self.init_embed_pick(pick_feats)
         delivery_embeddings = self.init_embed_delivery(delivery_feats)
