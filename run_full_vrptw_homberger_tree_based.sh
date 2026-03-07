@@ -88,8 +88,8 @@ for cfg in "$TRAIN_CONFIG" "$INFER_CONFIG" "$INIT_CONFIG"; do
   fi
 done
 
-echo "[1/4] Prepare Homberger VRPTW datasets"
-python tools/prepare_vrptw_homberger_pipeline.py --root "$ROOT_DIR" --train-sizes "${CURRICULUM_STAGES[@]}"
+# echo "[1/4] Prepare Homberger VRPTW datasets"
+# python tools/prepare_vrptw_homberger_pipeline.py --root "$ROOT_DIR" --train-sizes "${CURRICULUM_STAGES[@]}"
 
 echo "[2/4] Train VRPTW model (tree_based)"
 if [[ "$SKIP_TRAIN" -eq 0 ]]; then

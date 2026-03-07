@@ -35,6 +35,8 @@ import os
 
 import torch
 import math
+import logging
+import numpy as np
 import torch.nn.functional as F
 import yaml
 from stable_baselines3 import PPO
@@ -226,6 +228,7 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
     total_epochs : int
         Number of training epochs.
     """
+    print(f"[tree_based] Starting training for {total_epochs} epochs …")
     env_name   = config['problem_setup']['env'].upper()
     n_parallel = config['train']['n_parallel_problems']
     sampler    = Sampler(config)
@@ -252,7 +255,11 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
 
     data_steps = config['muzero']['data_steps_per_epoch']
 
-    print(
+    print(f"[tree_based] Training {env_name} for {total_epochs} epochs "
+          f"({data_steps} problems/epoch, {n_parallel} parallel) …")
+
+    logger = logging.getLogger(__name__)
+    logger.info(
         f"[tree_based] Training {env_name} for {total_epochs} epochs "
         f"({data_steps} problems/epoch, {n_parallel} parallel) …"
     )
@@ -273,14 +280,64 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
         n_iterations = max(1, data_steps // n_parallel)
         all_training_data = []
 
+        # Accumulate per-iteration diagnostic stats for logging
+        iter_best_returns = []
+        iter_forward_passes = []
+        iter_env_steps = []
         for _ in range(n_iterations):
+            print(f"[tree_based] Epoch {epoch + 1}/{total_epochs}, iteration {_ + 1}/{n_iterations} …")
             _, infos = collector.play_game(deterministic=False, training=True)
             td = infos.get('training_data')
             if td is not None and len(td) > 0:
                 all_training_data.append(td)
 
+            # collect diagnostics if available
+            try:
+                if 'best_return' in infos and infos['best_return'] is not None:
+                    br = infos['best_return']
+                    # convert to scalar mean if tensor/array/list
+                    try:
+                        br_mean = float(np.mean(br))
+                    except Exception:
+                        try:
+                            br_mean = float(torch.tensor(br).mean())
+                        except Exception:
+                            br_mean = None
+                    if br_mean is not None:
+                        iter_best_returns.append(br_mean)
+            except Exception:
+                pass
+            try:
+                if 'forward_passes' in infos and infos['forward_passes'] is not None:
+                    fp = infos['forward_passes']
+                    try:
+                        fp_mean = float(np.mean(fp))
+                    except Exception:
+                        try:
+                            fp_mean = float(torch.tensor(fp).mean())
+                        except Exception:
+                            fp_mean = None
+                    if fp_mean is not None:
+                        iter_forward_passes.append(fp_mean)
+            except Exception:
+                pass
+            try:
+                if 'env_steps' in infos and infos['env_steps'] is not None:
+                    es = infos['env_steps']
+                    try:
+                        es_mean = float(np.mean(es))
+                    except Exception:
+                        try:
+                            es_mean = float(torch.tensor(es).mean())
+                        except Exception:
+                            es_mean = None
+                    if es_mean is not None:
+                        iter_env_steps.append(es_mean)
+            except Exception:
+                pass
+
         if not all_training_data:
-            print(f"[tree_based] Epoch {epoch}: no training data collected, skipping update.")
+            logger.warning(f"[tree_based] Epoch {epoch}: no training data collected, skipping update.")
             continue
 
         training_data = torch.cat(all_training_data)
@@ -288,14 +345,22 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
         # ---- gradient update ----
         _ppo_update(model, training_data, config)
 
-        best_returns = [infos.get('best_return', None)]
-        mean_ret_str = ''
-        if best_returns[0] is not None:
-            mean_ret_str = f', mean_best_return={float(best_returns[0].mean()):.4f}'
-        print(
-            f"[tree_based] Epoch {epoch + 1}/{total_epochs}: "
-            f"{len(training_data)} training samples{mean_ret_str}"
+        # ---- logging ----
+        mean_best_return = np.mean(iter_best_returns) if len(iter_best_returns) > 0 else None
+        mean_forward_passes = np.mean(iter_forward_passes) if len(iter_forward_passes) > 0 else None
+        mean_env_steps = np.mean(iter_env_steps) if len(iter_env_steps) > 0 else None
+
+        msg = (
+            f"[tree_based] Epoch {epoch + 1}/{total_epochs}: {len(training_data)} training samples"
         )
+        if mean_best_return is not None:
+            msg += f", mean_best_return={mean_best_return:.4f}"
+        if mean_forward_passes is not None:
+            msg += f", mean_forward_passes={mean_forward_passes:.1f}"
+        if mean_env_steps is not None:
+            msg += f", mean_env_steps={mean_env_steps:.1f}"
+
+        logger.info(msg)
 
     # ---- save ----
     save_path = config['train']['save_model_path']
