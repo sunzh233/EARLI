@@ -19,21 +19,22 @@ train:
   gamma: 1
   multi_gpu: false
   block_decreasing_action: false
-  epochs: 0
-  batch_size: 64
-  n_beams: 16
-  pretrained_fname: "outputs/vrptw_model_homberger_800.m"
+  epochs: 16
+  batch_size: 512
+  n_beams: 8
+  pretrained_fname: null
   pretrained_run: null
-  save_model_path: "outputs/vrptw_model_homberger_700.m"
-  n_parallel_problems: 6
+  save_model_path: "outputs/vrptw_model_homberger_tree_800.m"
+  n_parallel_problems: 16
   learning_rate: 1e-4
 
 eval:
-  data_file: datasets/homberger_vrptw_curriculum/vrptw_test_1000.pkl
+  data_file: datasets/homberger_vrptw_curriculum/vrptw_train_200.pkl
+  val_data_file: datasets/homberger_vrptw_curriculum/vrptw_val_200.pkl
   max_problems: null
   apply_local_search: false
   deterministic_test_beam: true
-  detailed_test_log: true
+  detailed_test_log: false
   save_full_tree: false
   naive_greedy: false
 
@@ -46,9 +47,9 @@ problem_setup:
   time_penalty: 0.0
   time_penalty_early: 0.0
   time_penalty_late: 1.0
-  vehicle_penalty: 150
-  unused_capacity_penalty: 1.0
-  spare_numeric_capacity: 0.1
+  vehicle_penalty: 15
+  unused_capacity_penalty: 0.2
+  spare_numeric_capacity: 0
   single_site_visit: true
 
 representation:
@@ -89,12 +90,12 @@ attention_model:
   n_attention_layers_actor: 6
   n_attention_layers_critic: 4
   n_attention_layers_head_module: 4
-  n_attention_heads: 8
+  n_attention_heads: 16
   reweight_by_distance: false
   reweight_function: exponential
   use_basic_head_encoding: true
   separate_head_and_action_model: false
-  num_head_encoder_layers: 3
+  num_head_encoder_layers: 4
 
 sampler:
   score_to_prob: probs
@@ -114,7 +115,7 @@ muzero:
   max_leaves: 10
   data_steps_per_epoch: 256
   hash_states: true
-  max_moves: 5000
+  max_moves: 8000
 
 speedups:
   use_ray: false

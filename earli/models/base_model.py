@@ -101,7 +101,18 @@ class AbstractNetwork(torch.nn.Module):
     @torch.inference_mode()
     def predict(self, obs, state=None, episode_start=None, deterministic=True):
         values, logits, _ = self._forward(state=obs)
-        action, log_prob, entropy = self.sampler.sample(logits, unmasked_nodes=obs['feasible_nodes'], deterministic=deterministic)
+        feasible_nodes = obs['feasible_nodes']
+        if not isinstance(feasible_nodes, torch.Tensor):
+            feasible_nodes = torch.as_tensor(feasible_nodes, device=logits.device)
+        else:
+            feasible_nodes = feasible_nodes.to(logits.device)
+        feasible_nodes = feasible_nodes.to(torch.bool)
+
+        action, log_prob, entropy = self.sampler.sample(
+            logits,
+            unmasked_nodes=feasible_nodes,
+            deterministic=deterministic,
+        )
         model_info = {'value'    : values,
                       'log_probs': log_prob}
         return action, model_info

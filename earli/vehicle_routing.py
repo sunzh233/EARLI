@@ -463,7 +463,8 @@ class RoutingBase(GymEnv, VecEnv):
         seed_all(seed + self.worker_id, deterministic=self.config['train']['deterministic_algo'])
 
     def env_is_wrapped(self, wrapper_class, indices=None):
-        return False
+        indices = self._get_indices(indices)
+        return [False for _ in indices]
 
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
         """Return attribute from vectorized environment (see base class)."""

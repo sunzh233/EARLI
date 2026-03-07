@@ -34,9 +34,11 @@ import argparse
 import os
 
 import torch
+import math
 import torch.nn.functional as F
 import yaml
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback
 from yaml import SafeLoader
 
 from .models.attention_model import PosAttentionModel
@@ -85,6 +87,52 @@ def _resolve_datafile(config, env_name):
         return data_file
     else:
         raise ValueError("Config must specify either 'eval.data_file' or 'eval.data_files'.")
+                
+
+
+def make_lr_schedule(initial_lr: float,
+                     schedule_type: str = "constant",
+                     min_lr: float = 0.0,
+                     exp_decay: float = 5.0,
+                     step_ratio: float = 0.5,
+                     step_fraction: float = 0.5):
+    schedule_type = (schedule_type or "constant").lower()
+    min_lr = float(min_lr)
+    initial_lr = float(initial_lr)
+
+    if schedule_type == "constant":
+        return initial_lr
+
+    if schedule_type == "linear":
+        def linear_schedule(progress_remaining: float):
+            return min_lr + (initial_lr - min_lr) * float(progress_remaining)
+        return linear_schedule
+
+    if schedule_type == "cosine":
+        def cosine_schedule(progress_remaining: float):
+            completed = 1.0 - float(progress_remaining)
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * completed))
+            return min_lr + (initial_lr - min_lr) * cosine_factor
+        return cosine_schedule
+
+    if schedule_type == "exp":
+        def exp_schedule(progress_remaining: float):
+            completed = 1.0 - float(progress_remaining)
+            lr = initial_lr * math.exp(-float(exp_decay) * completed)
+            return max(min_lr, lr)
+        return exp_schedule
+
+    if schedule_type == "step":
+        step_ratio_clamped = min(max(float(step_ratio), 0.0), 1.0)
+        step_fraction_clamped = min(max(float(step_fraction), 0.0), 1.0)
+
+        def step_schedule(progress_remaining: float):
+            completed = 1.0 - float(progress_remaining)
+            lr = initial_lr if completed < step_fraction_clamped else initial_lr * step_ratio_clamped
+            return max(min_lr, lr)
+        return step_schedule
+
+    raise ValueError(f"Unknown lr schedule type: {schedule_type}")
 
 
 def _ppo_update(model, training_data, config,
@@ -298,6 +346,22 @@ def _train_ppo(config, env_class, datafile, total_steps):
 
     rollout_size = n_steps * n_parallel
 
+    # Optional periodic validation on eval.val_data_file.
+    val_datafile = config['eval'].get('val_data_file')
+    eval_callback = None
+    if val_datafile:
+        if not os.path.exists(val_datafile):
+            raise FileNotFoundError(
+                f"Validation dataset file not found: {val_datafile}"
+            )
+        eval_env = env_class(config, datafile=val_datafile, env_type='train')
+        eval_callback = EvalCallback(
+            eval_env,
+            eval_freq=max(1, n_steps),
+            deterministic=bool(config['eval'].get('deterministic_test_beam', True)),
+            verbose=1,
+        )
+
     sb3_model = PPO(
         policy=PosAttentionModel,
         env=env,
@@ -305,9 +369,20 @@ def _train_ppo(config, env_class, datafile, total_steps):
         n_steps=n_steps,
         batch_size=config['train']['batch_size'],
         learning_rate=(
-            config['train']['learning_rate']
-            if callable(config['train']['learning_rate'])
-            else float(config['train']['learning_rate'])
+            # build a schedule if configured, otherwise accept float or callable
+            make_lr_schedule(
+                initial_lr=config['train'].get('learning_rate', 1e-4),
+                schedule_type=config['train'].get('lr_schedule', None) or 'constant',
+                min_lr=config['train'].get('min_learning_rate', 0.0),
+                exp_decay=config['train'].get('lr_exp_decay', 5.0),
+                step_ratio=config['train'].get('lr_step_ratio', 0.5),
+                step_fraction=config['train'].get('lr_step_fraction', 0.5),
+            ) if not callable(config['train'].get('learning_rate')) and config['train'].get('lr_schedule', None) is not None
+            else (
+                config['train']['learning_rate']
+                if callable(config['train']['learning_rate'])
+                else float(config['train']['learning_rate'])
+            )
         ),
         ent_coef=0,
         verbose=1,
@@ -319,7 +394,12 @@ def _train_ppo(config, env_class, datafile, total_steps):
         f"{config['muzero']['data_steps_per_epoch']} data steps/epoch, "
         f"n_steps={n_steps}, n_parallel={n_parallel}, rollout_size={rollout_size}) …"
     )
-    sb3_model.learn(total_steps, log_interval=1)
+    if eval_callback is not None:
+        print(
+            f"[ppo] Validation enabled: val_data_file={val_datafile}, "
+            f"eval_freq={max(1, n_steps)} (matches rollout collection frequency)"
+        )
+    sb3_model.learn(total_steps, log_interval=1, callback=eval_callback)
 
     save_path = config['train']['save_model_path']
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)

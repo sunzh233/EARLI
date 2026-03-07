@@ -8,6 +8,8 @@ TRAIN_CONFIG="config_train_vrptw_homberger.yaml"
 INFER_CONFIG="config_infer_vrptw_homberger.yaml"
 INIT_CONFIG="config_initialization_vrptw_homberger.yaml"
 TRAIN_STEPS="512000"
+STAGE_TOTAL_STEPS=""
+STAGE_N_STEPS=""
 SKIP_TRAIN=0
 CURRICULUM_STAGES=(200 400 600 800)
 DATA_DIR="datasets/homberger_vrptw_curriculum"
@@ -23,6 +25,8 @@ Options:
   --infer-config PATH   Inference config (default: config_infer_vrptw_homberger.yaml)
   --init-config PATH    Injection config (default: config_initialization_vrptw_homberger.yaml)
   --train-steps N       Total training steps for earli.train (default: 512000)
+  --stage-total-steps L Comma list for per-stage total_steps (e.g. 128000,256000,384000,512000)
+  --stage-n-steps L     Comma list for per-stage train.n_steps (e.g. 512,1024,2048,4096)
   --stages S1,S2,...    Curriculum stage sizes (default: 200,400,600,800)
   --max-injections N    Max number of RL solutions injected into cuOpt_RL per problem
   --skip-train          Skip training and reuse configured pretrained model
@@ -40,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       INIT_CONFIG="$2"; shift 2 ;;
     --train-steps)
       TRAIN_STEPS="$2"; shift 2 ;;
+    --stage-total-steps)
+      STAGE_TOTAL_STEPS="$2"; shift 2 ;;
+    --stage-n-steps)
+      STAGE_N_STEPS="$2"; shift 2 ;;
     --stages)
       IFS=',' read -r -a CURRICULUM_STAGES <<< "$2"; shift 2 ;;
     --max-injections)
@@ -55,6 +63,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+STAGE_TOTAL_STEPS_ARR=()
+if [[ -n "$STAGE_TOTAL_STEPS" ]]; then
+  IFS=',' read -r -a STAGE_TOTAL_STEPS_ARR <<< "$STAGE_TOTAL_STEPS"
+  if [[ "${#STAGE_TOTAL_STEPS_ARR[@]}" -ne "${#CURRICULUM_STAGES[@]}" ]]; then
+    echo "[ERROR] --stage-total-steps length (${#STAGE_TOTAL_STEPS_ARR[@]}) must match --stages length (${#CURRICULUM_STAGES[@]})"
+    exit 1
+  fi
+fi
+
+STAGE_N_STEPS_ARR=()
+if [[ -n "$STAGE_N_STEPS" ]]; then
+  IFS=',' read -r -a STAGE_N_STEPS_ARR <<< "$STAGE_N_STEPS"
+  if [[ "${#STAGE_N_STEPS_ARR[@]}" -ne "${#CURRICULUM_STAGES[@]}" ]]; then
+    echo "[ERROR] --stage-n-steps length (${#STAGE_N_STEPS_ARR[@]}) must match --stages length (${#CURRICULUM_STAGES[@]})"
+    exit 1
+  fi
+fi
+
 for cfg in "$TRAIN_CONFIG" "$INFER_CONFIG" "$INIT_CONFIG"; do
   if [[ ! -f "$cfg" ]]; then
     echo "[ERROR] Missing config: $cfg"
@@ -69,7 +95,17 @@ echo "[2/4] Train VRPTW model"
 if [[ "$SKIP_TRAIN" -eq 0 ]]; then
   PREV_MODEL=""
   FINAL_MODEL=""
-  for SIZE in "${CURRICULUM_STAGES[@]}"; do
+  for IDX in "${!CURRICULUM_STAGES[@]}"; do
+    SIZE="${CURRICULUM_STAGES[$IDX]}"
+    STAGE_TOTAL_STEP="${TRAIN_STEPS}"
+    STAGE_N_STEP=""
+    if [[ "${#STAGE_TOTAL_STEPS_ARR[@]}" -gt 0 ]]; then
+      STAGE_TOTAL_STEP="${STAGE_TOTAL_STEPS_ARR[$IDX]}"
+    fi
+    if [[ "${#STAGE_N_STEPS_ARR[@]}" -gt 0 ]]; then
+      STAGE_N_STEP="${STAGE_N_STEPS_ARR[$IDX]}"
+    fi
+
     STAGE_CFG="$(mktemp /tmp/config_train_vrptw_stage_${SIZE}.XXXXXX.yaml)"
     MODEL_PATH="outputs/vrptw_model_homberger_${SIZE}.m"
     python - <<PY
@@ -83,6 +119,9 @@ cfg['eval']['val_data_file'] = '$DATA_DIR/vrptw_val_${SIZE}.pkl'
 cfg.setdefault('train', {})['save_model_path'] = '$MODEL_PATH'
 prev = '$PREV_MODEL'.strip()
 cfg['train']['pretrained_fname'] = prev if prev else None
+stage_n_steps = '$STAGE_N_STEP'.strip()
+if stage_n_steps:
+  cfg['train']['n_steps'] = int(stage_n_steps)
 
 with open('$STAGE_CFG', 'w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
@@ -91,11 +130,12 @@ print('Stage config:', '$STAGE_CFG')
 print('Train file  :', cfg['eval']['data_file'])
 print('Val file    :', cfg['eval']['val_data_file'])
 print('Init model  :', cfg['train']['pretrained_fname'])
+print('n_steps     :', cfg['train'].get('n_steps'))
 print('Save model  :', cfg['train']['save_model_path'])
 PY
 
-    echo "[2/4][stage ${SIZE}] train --total-steps ${TRAIN_STEPS}"
-    python -m earli.train --config "$STAGE_CFG" --total-steps "$TRAIN_STEPS"
+  echo "[2/4][stage ${SIZE}] train --total-steps ${STAGE_TOTAL_STEP} (n_steps=${STAGE_N_STEP:-from_config})"
+  python -m earli.train --config "$STAGE_CFG" --total-steps "$STAGE_TOTAL_STEP"
     PREV_MODEL="$MODEL_PATH"
     FINAL_MODEL="$MODEL_PATH"
   done

@@ -162,10 +162,12 @@ class VRPTW(VRP):
         """Extend VRP step with time-window updates."""
         import numpy
 
+        target_device = self.head.device
+
         if isinstance(actions, numpy.ndarray) or isinstance(actions, list):
-            actions = torch.tensor(actions, dtype=torch.long)
+            actions = torch.tensor(actions, dtype=torch.long, device=target_device)
         else:
-            actions = actions.to(int)
+            actions = actions.to(device=target_device, dtype=torch.long)
         actions = actions.clone().view(-1)
         n_actions = len(actions)
 
@@ -192,7 +194,7 @@ class VRPTW(VRP):
 
         active_env = actions >= 0
         actions[~active_env] = 0
-        dummy_ind = torch.arange(n_actions, dtype=torch.long)
+        dummy_ind = torch.arange(n_actions, dtype=torch.long, device=target_device)
         from_depot = active_env & (head[:n_actions] == DEPOT_LOCATION)
         depot_visit = active_env & (actions == DEPOT_LOCATION)
         visit_site = actions.clone()
@@ -259,7 +261,8 @@ class VRPTW(VRP):
         if calc_obs:
             obs = self.get_pos_representation()
         if self.config['train']['method'] == 'ppo':
-            reward, dones = reward.numpy(), dones.numpy()
+            reward = reward.detach().cpu().numpy()
+            dones = dones.detach().cpu().numpy()
         return obs, reward, dones, info
 
     # ------------------------------------------------------------------

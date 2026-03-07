@@ -68,7 +68,12 @@ class PosAttentionModel(AbstractNetwork, ActorCriticPolicy):
 
     def forward(self, state, *args, inference_mode=True, lazy=False, batch_shape=None, copy_to_cpu=True,
                 deterministic: bool = False, **kwargs):
-        values, policy_logits, batch_shape = self._forward(batch_shape, lazy, state)
+        values, policy_logits, batch_shape = self._forward(
+            state=state,
+            batch_shape=batch_shape,
+            lazy=lazy,
+            **kwargs,
+        )
         if self.config['system']['compatibility_mode'] == 'stable_baselines':
             action, log_prob, entropy = self.sampler.sample(policy_logits, unmasked_nodes=state['feasible_nodes'].to(bool),
                                                             deterministic=False)
@@ -84,7 +89,7 @@ class PosAttentionModel(AbstractNetwork, ActorCriticPolicy):
                 values = values.cpu()
             return policy_logits, values, state_score
 
-    def _forward(self, batch_shape, lazy, state):
+    def _forward(self, state, batch_shape=None, lazy=False, **kwargs):
         if self.config['system']['compatibility_mode'] == 'stable_baselines':
             batch_shape = (state['loc'].shape[0],)
         if batch_shape is not None:
