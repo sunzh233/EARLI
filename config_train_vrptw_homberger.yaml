@@ -27,7 +27,7 @@ train:
   save_model_path: "outputs/vrptw_model_homberger_800.m"
   n_parallel_problems: 16
   learning_rate: 1e-4
-  n_steps: 1536
+  n_steps: 2048
 
 eval:
   data_file: datasets/homberger_vrptw_curriculum/vrptw_train_200.pkl
@@ -116,7 +116,7 @@ muzero:
   max_leaves: 10
   data_steps_per_epoch: 256
   hash_states: true
-  max_moves: 5000
+  max_moves: 8000
 
 speedups:
   use_ray: false
@@ -133,7 +133,9 @@ cuopt:
   climbers: 2048
 
 buffer:
-  max_buffer_size: 300000
+  # PPO training here is driven by SB3's rollout buffer; keep this custom buffer
+  # bounded to one rollout for compatibility without reserving an oversized cap.
+  max_buffer_size: 24576
   allow_overflow: true
   on_policy_buffer: true
   buffer_precision: float32

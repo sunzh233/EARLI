@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch import Tensor
+from ..vrp import build_attention_matrix
 
 from .attention_base.decoder import AutoregressiveDecoder, PrecomputedCache
 from .attention_base.encoder import GraphAttentionEncoder
@@ -158,16 +159,21 @@ class ActorAttentionModel(nn.Module):
 
         # ENCODER: get embeddings from initial state
         inference_mode= torch.is_inference_mode_enabled() or not self.train_actor
-        visible_nodes= state['visible_nodes'].to(bool)
+        visible_nodes = state['visible_nodes'].to(bool)
+        attn_mask = state.get('attention_matrix', None)
+        if attn_mask is None:
+            attn_mask = build_attention_matrix(visible_nodes)
+        else:
+            attn_mask = attn_mask.to(bool)
         with torch.inference_mode(mode=inference_mode):
-            embeddings = self.encoder(state, mask=state['attention_matrix'].to(bool), vector_mask=visible_nodes)
+            embeddings = self.encoder(state, mask=attn_mask, vector_mask=visible_nodes)
 
             # the depot column in the visible matrix is always the visible_nodes, as the depot is always visible
             cached_embeds = self._precompute_cache(embeddings, visible_nodes=visible_nodes)
 
             log_p, head_encoding = self.decoder.get_log_p(cached_embeds, state,inference_mode=inference_mode)
         if self.config['attention_model']['separate_head_and_action_model']:
-            head_encoding = self.head_encoder(state, mask=state['attention_matrix'].to(bool), vector_mask=visible_nodes)
+            head_encoding = self.head_encoder(state, mask=attn_mask, vector_mask=visible_nodes)
             if self.config['model']['agg_type'] == 'sum':
                 head_encoding[~visible_nodes] = 0  # Set the masked nodes to 0
                 head_encoding = self.project_fixed_context(head_encoding.sum(dim=1))

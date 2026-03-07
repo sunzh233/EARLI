@@ -103,41 +103,59 @@ class VRP(RoutingBase):
         self.max_prior_size = 2 * self.max_edges
         # Edge features: distance, prior, type (KNN, link to depot, self loop, prior edge)
         # Node features: depot/non depot, demand, head position, masked / unmasked
+        # SB3 DictRolloutBuffer stores Dict observations as float32, including bool
+        # tensors. Storing a full (N x N) attention matrix per step can dominate
+        # RAM at large N, so we disable it by default for SB3 and rebuild masks
+        # on-the-fly in the model from visible_nodes.
+        self.store_attention_matrix_obs = bool(
+            self.config['representation'].get(
+                'store_attention_matrix_obs',
+                not self.stable_baselines_compatibility,
+            )
+        )
+
         if self.stable_baselines_compatibility:
             self.action_space = Discrete(self.problem_size)
-            self.observation_space = Dict(
-                    {'loc'             : Box(low=-np.inf, high=np.inf, shape=(self.problem_size, 2)),
-                     'demand'          : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                     'head'            : Box(low=0, high=self.problem_size + 1, shape=(1,), dtype=int),
-                     # Discrete(*self.batch_dim, self.problem_size),
-                     'capacity'        : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                     'attention_matrix': Box(low=0.0, high=1.0, shape=(1, self.problem_size, self.problem_size),
-                                             dtype=bool),
-                     'visible_nodes'   : Box(low=0.0, high=1.0, shape=(self.problem_size,), dtype=bool),
-                     'feasible_nodes'  : Box(low=0.0, high=1.0, shape=(self.problem_size,), dtype=bool),
-                     'remaining_demand': Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                     'remaining_nodes' : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
-                     'head_feature'    : Box(low=0, high=1, shape=(self.problem_size, 1), dtype=bool),
-                     'acc_returns'     : Box(low=-np.inf, high=np.inf, shape=(1,), dtype=float)
-                     })
+            obs_spaces = {
+                'loc'             : Box(low=-np.inf, high=np.inf, shape=(self.problem_size, 2)),
+                'demand'          : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'head'            : Box(low=0, high=self.problem_size + 1, shape=(1,), dtype=int),
+                'capacity'        : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'visible_nodes'   : Box(low=0.0, high=1.0, shape=(self.problem_size,), dtype=bool),
+                'feasible_nodes'  : Box(low=0.0, high=1.0, shape=(self.problem_size,), dtype=bool),
+                'remaining_demand': Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'remaining_nodes' : Box(low=0, high=np.inf, shape=(self.problem_size, 1)),
+                'head_feature'    : Box(low=0, high=1, shape=(self.problem_size, 1), dtype=bool),
+                'acc_returns'     : Box(low=-np.inf, high=np.inf, shape=(1,), dtype=float),
+            }
+            if self.store_attention_matrix_obs:
+                obs_spaces['attention_matrix'] = Box(
+                    low=0.0, high=1.0, shape=(1, self.problem_size, self.problem_size), dtype=bool,
+                )
+            self.observation_space = Dict(obs_spaces)
         else:
             self.action_space = Box(low=0, high=self.problem_size - 1, shape=self.batch_dim,
                                     dtype=int)  # Discrete(self.problem_size))
-            self.observation_space = Dict(
-                    {'loc'             : Box(low=-np.inf, high=np.inf, shape=(*self.batch_dim, self.problem_size, 2)),
-                     'demand'          : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                     'head'            : Box(low=0, high=self.problem_size + 1, shape=(*self.batch_dim, 1), dtype=int),
-                     # Discrete(*self.batch_dim, self.problem_size),
-                     'capacity'        : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                     'attention_matrix': Box(low=0.0, high=1.0, shape=(*self.batch_dim, 1, self.problem_size, self.problem_size),
-                                             dtype=bool),
-                     'visible_nodes'   : Box(low=0.0, high=1.0, shape=(*self.batch_dim, self.problem_size,), dtype=bool),
-                     'feasible_nodes'  : Box(low=0.0, high=1.0, shape=(*self.batch_dim, self.problem_size,), dtype=bool),
-                     'remaining_demand': Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                     'remaining_nodes' : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
-                     'head_feature'    : Box(low=0, high=1, shape=(*self.batch_dim, self.problem_size, 1), dtype=bool),
-                     'acc_returns'     : Box(low=-np.inf, high=np.inf, shape=(*self.batch_dim, 1), dtype=float)
-                     })
+            obs_spaces = {
+                'loc'             : Box(low=-np.inf, high=np.inf, shape=(*self.batch_dim, self.problem_size, 2)),
+                'demand'          : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'head'            : Box(low=0, high=self.problem_size + 1, shape=(*self.batch_dim, 1), dtype=int),
+                'capacity'        : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'visible_nodes'   : Box(low=0.0, high=1.0, shape=(*self.batch_dim, self.problem_size,), dtype=bool),
+                'feasible_nodes'  : Box(low=0.0, high=1.0, shape=(*self.batch_dim, self.problem_size,), dtype=bool),
+                'remaining_demand': Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'remaining_nodes' : Box(low=0, high=np.inf, shape=(*self.batch_dim, self.problem_size, 1)),
+                'head_feature'    : Box(low=0, high=1, shape=(*self.batch_dim, self.problem_size, 1), dtype=bool),
+                'acc_returns'     : Box(low=-np.inf, high=np.inf, shape=(*self.batch_dim, 1), dtype=float),
+            }
+            if self.store_attention_matrix_obs:
+                obs_spaces['attention_matrix'] = Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(*self.batch_dim, 1, self.problem_size, self.problem_size),
+                    dtype=bool,
+                )
+            self.observation_space = Dict(obs_spaces)
 
         self.terminal_state = {'demand'     : torch.zeros([1, self.problem_size], device=self.device),
                                'capacity'   : torch.zeros([1, 1], device=self.device),
@@ -339,7 +357,6 @@ class VRP(RoutingBase):
         visible_nodes = self.non_zero_demand[indices].clone().view(-1, self.problem_size)
         visible_nodes[all_ind, head] = True
         visible_nodes[:, DEPOT_LOCATION] = True
-        attention_matrix = build_attention_matrix(visible_nodes)
 
         demand = self.demand[indices].view(-1, self.problem_size)
         non_zero_demand = self.non_zero_demand[indices].clone().view(-1, self.problem_size)
@@ -356,7 +373,6 @@ class VRP(RoutingBase):
                'demand'          : self.demand[indices].unsqueeze(-1).clone(),
                'head'            : self.head[indices].clone(),
                'capacity'        : self.capacity[indices].unsqueeze(-1).expand_as(head_feature).clone(),
-               'attention_matrix': attention_matrix.view(*batch_dim, *attention_matrix.shape[1:]),
                'visible_nodes'   : visible_nodes.view(*batch_dim, *visible_nodes.shape[1:]),
                'feasible_nodes'  : self.feasible_nodes[indices].clone(),
                'remaining_demand': remaining_demand_feature,
@@ -364,6 +380,9 @@ class VRP(RoutingBase):
                'head_feature'    : head_feature.type(torch.bool),  # bool for consistency with the buffer
                'acc_returns'     : self.acc_returns[indices].clone()
                }
+        if self.store_attention_matrix_obs:
+            attention_matrix = build_attention_matrix(visible_nodes)
+            obs['attention_matrix'] = attention_matrix.view(*batch_dim, *attention_matrix.shape[1:])
 
         if self.config['system']['use_tensordict']:
             obs = TensorDict(obs, batch_size=batch_dim)

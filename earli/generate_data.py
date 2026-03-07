@@ -4,6 +4,7 @@
 import logging
 import os
 import pickle
+import gc
 import torch
 import numpy as np
 
@@ -52,7 +53,10 @@ class ProblemLoader(object):
             pos_val = loaded_data_pkl['positions']
             if problem_range is not None:
                 pos_val = pos_val[problem_range[0]:problem_range[1]]
+            # prefer float32 to reduce memory footprint
             if isinstance(pos_val, np.ndarray):
+                if pos_val.dtype == np.float64:
+                    pos_val = pos_val.astype(np.float32)
                 data['positions'] = torch.from_numpy(pos_val)
             elif isinstance(pos_val, torch.Tensor):
                 data['positions'] = pos_val
@@ -85,7 +89,10 @@ class ProblemLoader(object):
             dm_val = loaded_data_pkl['distance_matrix']
             if problem_range is not None:
                 dm_val = dm_val[problem_range[0]:problem_range[1]]
+            # distance matrices are often the largest tensors; cast to float32
             if isinstance(dm_val, np.ndarray):
+                if dm_val.dtype == np.float64:
+                    dm_val = dm_val.astype(np.float32)
                 data['distance_matrix'] = torch.from_numpy(dm_val)
             elif isinstance(dm_val, torch.Tensor):
                 data['distance_matrix'] = dm_val
@@ -187,6 +194,13 @@ class ProblemLoader(object):
                 data['pairs'] = pairs_val.long()
             else:
                 raise TypeError(f"Field 'pairs' has unsupported type: {type(pairs_val)}")
+
+        # Try to free the original loaded pickle to reduce peak memory usage
+        try:
+            del loaded_data_pkl
+            gc.collect()
+        except Exception:
+            pass
 
         # Ensure essential data used by RoutingBase.set_problem_data is present
         for key_check in ['positions', 'demand', 'distance_matrix', 'capacity', 'id', 'n_problems', 'radius', 'env_type']:

@@ -2,6 +2,7 @@ from typing import Callable, Optional, Union
 
 from tensordict import TensorDict
 from torch import Tensor, nn
+from ..vrp import build_attention_matrix
 
 from .attention_base.env_embeddings.init import VRPInitEmbedding
 from .attention_base.graph.attnnet import GraphAttentionNetwork
@@ -75,6 +76,12 @@ class CriticNetwork(nn.Module):
 
         # Initial embedding of x. This is the identity function if env_name is None.
         embeddings = self.init_embedding(x)
-        encoded_embeddings = self.encoder(embeddings, mask=x['attention_matrix'].to(bool),
-                                          vector_mask=x['visible_nodes'].to(bool))
+        visible_nodes = x['visible_nodes'].to(bool)
+        attn_mask = x.get('attention_matrix', None)
+        if attn_mask is None:
+            attn_mask = build_attention_matrix(visible_nodes)
+        else:
+            attn_mask = attn_mask.to(bool)
+        encoded_embeddings = self.encoder(embeddings, mask=attn_mask,
+                                          vector_mask=visible_nodes)
         return self.value_head(encoded_embeddings).mean(1)  # todo: no reason to take the mean
