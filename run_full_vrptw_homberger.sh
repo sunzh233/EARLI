@@ -118,7 +118,7 @@ cfg.setdefault('eval', {})['data_file'] = '$DATA_DIR/vrptw_train_${SIZE}.pkl'
 cfg['eval']['val_data_file'] = '$DATA_DIR/vrptw_val_${SIZE}.pkl'
 cfg.setdefault('train', {})['save_model_path'] = '$MODEL_PATH'
 prev = '$PREV_MODEL'.strip()
-cfg['train']['pretrained_fname'] = prev if prev else None
+cfg['train']['pretrained_fname'] = prev if prev else 'outputs/vrptw_model_homberger_600.m'
 stage_n_steps = '$STAGE_N_STEP'.strip()
 if stage_n_steps:
   cfg['train']['n_steps'] = int(stage_n_steps)

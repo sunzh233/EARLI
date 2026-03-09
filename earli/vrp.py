@@ -207,10 +207,24 @@ class VRP(RoutingBase):
         if not self.fix_envs and self.episode_counter + n_problems_to_reset >= dataset_size - 1:
             self.data = self.problem_generator.create_dataset(dataset_type=self.config['problem_setup']['env'])
             self.set_problem_data(data=self.data)
-        # partial indices is probably not going to be supported anymore
-        fixed_dataset_indices = cyclic_indexing(self.episode_counter % dataset_size,
-                                                n_problems_to_reset,
-                                                dataset_size)
+        # For training, optionally randomize dataset sampling so each rollout
+        # uses a small random subset rather than a deterministic cyclic slice.
+        sampling_mode = self.config.get('train', {}).get('sampling_mode', 'cyclic')
+        if (
+            self.fix_envs
+            and self.env_type == 'train'
+            and isinstance(sampling_mode, str)
+            and sampling_mode.lower() in {'random', 'random_with_replacement'}
+        ):
+            fixed_dataset_indices = np.random.randint(0, dataset_size, size=n_problems_to_reset)
+        else:
+            # partial indices is probably not going to be supported anymore
+            fixed_dataset_indices = cyclic_indexing(
+                self.episode_counter % dataset_size,
+                n_problems_to_reset,
+                dataset_size,
+            )
+        self.last_dataset_indices = fixed_dataset_indices
         if self.extended_output_format:
             pos = (self.reference['positions'][fixed_dataset_indices]
                    .unsqueeze(1).clone().expand_as(self.pos[indices]))

@@ -46,7 +46,7 @@ problem_setup:
   time_penalty: 0.0
   time_penalty_early: 0.0
   time_penalty_late: 1.0
-  vehicle_penalty: 50
+  vehicle_penalty: 10
   unused_capacity_penalty: 0.2
   spare_numeric_capacity: 0
   single_site_visit: true
@@ -80,7 +80,7 @@ model:
   reset_last_k_modules: 0
   single_network: false
   attention: true
-  split_actor_and_state_models: true
+  split_actor_and_state_models: false
   lazy: true
   eight_rounding: false
 

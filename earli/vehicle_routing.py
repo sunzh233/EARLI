@@ -469,7 +469,13 @@ class RoutingBase(GymEnv, VecEnv):
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
         """Return attribute from vectorized environment (see base class)."""
         indices = self._get_indices(indices)
-        return getattr(self, attr_name)[indices]
+        attr = getattr(self, attr_name)
+        if attr is None:
+            # Return a list of None values for the requested indices so callers
+            # that index into the result (e.g. VecEnv base init) receive a
+            # subscriptable sequence rather than raising on None.
+            return [None for _ in indices]
+        return attr[indices]
 
     def set_attr(self, attr_name: str, value: Any, indices: VecEnvIndices = None) -> None:
         raise NotImplementedError
@@ -479,11 +485,30 @@ class RoutingBase(GymEnv, VecEnv):
         raise NotImplementedError
         # return self.venv.env_method(method_name, *method_args, indices=indices, **method_kwargs)
 
-    def step_wait(self):
-        raise NotImplementedError
-
     def step_async(self, actions: np.ndarray):
-        raise NotImplementedError
+        """Synchronous compatibility: execute a step immediately and cache the result.
+
+        This allows VecEnv wrappers that call `step_async`/`step_wait` to work
+        in a single-process environment without implementing true async logic.
+        """
+        self._async_actions = actions
+        # Execute step synchronously and cache result for step_wait()
+        self._last_step_result = self.step(actions)
+
+    def step_wait(self):
+        """Return the result cached by `step_async`.
+
+        Raises
+        ------
+        RuntimeError
+            If `step_wait` is called before `step_async` has populated a result.
+        """
+        res = getattr(self, '_last_step_result', None)
+        if res is None:
+            raise RuntimeError('step_wait called without a completed step_async')
+        # Clear cached result and return it
+        self._last_step_result = None
+        return res
 
     def is_delivery_action(self, action):
         return action != 0

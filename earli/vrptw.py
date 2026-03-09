@@ -115,12 +115,14 @@ class VRPTW(VRP):
 
     def reset_static_properties(self, n_problems_to_reset, copy_all, indices):
         n = super().reset_static_properties(n_problems_to_reset, copy_all, indices)
-        dataset_size = self.reference['positions'].shape[0]
-        fixed_dataset_indices = cyclic_indexing(
-            (self.episode_counter - n_problems_to_reset) % dataset_size,
-            n_problems_to_reset,
-            dataset_size,
-        )
+        fixed_dataset_indices = getattr(self, 'last_dataset_indices', None)
+        if fixed_dataset_indices is None:
+            dataset_size = self.reference['positions'].shape[0]
+            fixed_dataset_indices = cyclic_indexing(
+                (self.episode_counter - n_problems_to_reset) % dataset_size,
+                n_problems_to_reset,
+                dataset_size,
+            )
         tw = self.reference['time_windows'][fixed_dataset_indices].clone()   # (n, n_nodes, 2)
         svc = self.reference['service_times'][fixed_dataset_indices].clone()  # (n, n_nodes)
 

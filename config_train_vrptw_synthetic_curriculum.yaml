@@ -19,23 +19,29 @@ train:
   gamma: 1
   multi_gpu: false
   block_decreasing_action: false
-  epochs: 16
+  epochs: 8
   batch_size: 128
   n_beams: 0
   pretrained_fname: null
   pretrained_run: null
-  save_model_path: "outputs/vrptw_model_homberger_800.m"
-  n_parallel_problems: 16
+  save_model_path: "outputs/vrptw_model_synth_50.m"
+  n_parallel_problems: 12
   learning_rate: 1.5e-5
-  # Learning rate schedule: options: constant, linear, cosine, exp, step
   lr_schedule: exp
-  # Minimum learning rate reached at end of schedule
   min_learning_rate: 1e-9
-  n_steps: 2048
+  n_steps: 96
+  gae_lambda: 0.95
+  clip_range: 0.15
+  vf_coef: 0.5
+  ent_coef: 0.0
+  max_grad_norm: 0.4
+  target_kl: 0.1
+  sampling_mode: random_with_replacement
 
 eval:
-  data_file: datasets/homberger_vrptw_curriculum/vrptw_train_200.pkl
-  val_data_file: datasets/homberger_vrptw_curriculum/vrptw_val_200.pkl
+  data_file: datasets/vrptw_homberger_like_curriculum/vrptw_train_50.pkl
+  val_data_file: datasets/vrptw_homberger_like_curriculum/vrptw_val_50.pkl
+  n_eval_episodes: 50
   max_problems: null
   apply_local_search: false
   deterministic_test_beam: true
@@ -52,7 +58,7 @@ problem_setup:
   time_penalty: 0.0
   time_penalty_early: 0.0
   time_penalty_late: 1.0
-  vehicle_penalty: 50
+  vehicle_penalty: 10
   unused_capacity_penalty: 0.2
   spare_numeric_capacity: 0
   single_site_visit: true
@@ -112,7 +118,6 @@ sampler:
   use_full_action_space_calc: true
   autoregressive: true
 
-
 muzero:
   expansion_method: "POLICY_LEAD_SEARCH"
   deterministic_branch_in_k_beams: false
@@ -121,7 +126,7 @@ muzero:
   max_leaves: 10
   data_steps_per_epoch: 256
   hash_states: true
-  max_moves: 8000
+  max_moves: 12000
 
 speedups:
   use_ray: false
@@ -138,8 +143,6 @@ cuopt:
   climbers: 2048
 
 buffer:
-  # PPO training here is driven by SB3's rollout buffer; keep this custom buffer
-  # bounded to one rollout for compatibility without reserving an oversized cap.
   max_buffer_size: 24576
   allow_overflow: true
   on_policy_buffer: true

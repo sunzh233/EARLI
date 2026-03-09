@@ -41,6 +41,10 @@ import torch.nn.functional as F
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecMonitor
 from yaml import SafeLoader
 
 from .models.attention_model import PosAttentionModel
@@ -394,7 +398,13 @@ def _train_ppo(config, env_class, datafile, total_steps):
     """
     env_name = config['problem_setup']['env'].upper()
     env      = env_class(config, datafile=datafile, env_type='train')
-
+    # Wrap environment so SB3 can track episode rewards/lengths. If the
+    # environment is already a VecEnv (RoutingBase), use VecMonitor; otherwise
+    # use Monitor for single-env wrappers.
+    if isinstance(env, VecEnv):
+        env = VecMonitor(env)
+    else:
+        env = Monitor(env)
     # Keep rollout horizon independent from total_steps so changing total_steps
     # increases the number of PPO rollouts/iterations instead of only enlarging
     # a single rollout. Priority:
@@ -419,13 +429,27 @@ def _train_ppo(config, env_class, datafile, total_steps):
             raise FileNotFoundError(
                 f"Validation dataset file not found: {val_datafile}"
             )
-        eval_env = env_class(config, datafile=val_datafile, env_type='train')
+        # Use eval mode so validation remains stable and does not inherit
+        # training-time random sampling behavior.
+        n_eval_episodes = int(config['eval'].get('n_eval_episodes', 50))
+        n_eval_episodes = max(1, n_eval_episodes)
+        eval_env = env_class(config, datafile=val_datafile, env_type='eval')
+        if isinstance(eval_env, VecEnv):
+            eval_env = VecMonitor(eval_env)
+        else:
+            eval_env = Monitor(eval_env)
         eval_callback = EvalCallback(
             eval_env,
             eval_freq=max(1, n_steps),
+            n_eval_episodes=n_eval_episodes,
             deterministic=bool(config['eval'].get('deterministic_test_beam', True)),
             verbose=1,
         )
+
+    # Prepare TensorBoard logging directory/name
+    tb_dir = config.get('system', {}).get('tensorboard_logdir', 'outputs/tensorboard')
+    tb_name = config.get('system', {}).get('run_name') or 'earli_ppo'
+    os.makedirs(tb_dir, exist_ok=True)
 
     sb3_model = PPO(
         policy=PosAttentionModel,
@@ -433,6 +457,17 @@ def _train_ppo(config, env_class, datafile, total_steps):
         policy_kwargs={'config': config},
         n_steps=n_steps,
         batch_size=config['train']['batch_size'],
+        n_epochs=int(config['train'].get('epochs', 10)),
+        gamma=float(config['train'].get('gamma', 0.99)),
+        gae_lambda=float(config['train'].get('gae_lambda', 0.95)),
+        clip_range=float(config['train'].get('clip_range', 0.2)),
+        vf_coef=float(config['train'].get('vf_coef', 0.5)),
+        max_grad_norm=float(config['train'].get('max_grad_norm', 0.5)),
+        target_kl=(
+            float(config['train']['target_kl'])
+            if config['train'].get('target_kl', None) is not None
+            else None
+        ),
         learning_rate=(
             # build a schedule if configured, otherwise accept float or callable
             make_lr_schedule(
@@ -449,9 +484,45 @@ def _train_ppo(config, env_class, datafile, total_steps):
                 else float(config['train']['learning_rate'])
             )
         ),
-        ent_coef=0,
+        ent_coef=float(config['train'].get('ent_coef', 0.0)),
         verbose=1,
+        tensorboard_log=tb_dir,
     )
+
+    # Load pretrained weights into the SB3 policy if specified and available
+    pretrained_fname = config['train'].get('pretrained_fname')
+    if pretrained_fname:
+        if os.path.exists(pretrained_fname):
+            checkpoint = torch.load(pretrained_fname, weights_only=False)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            model_state = sb3_model.policy.state_dict()
+            compatible_state = {}
+            skipped = []
+            for key, value in state_dict.items():
+                if key not in model_state:
+                    skipped.append(key)
+                    continue
+                try:
+                    if model_state[key].shape != value.shape:
+                        skipped.append(key)
+                        continue
+                except Exception:
+                    skipped.append(key)
+                    continue
+                compatible_state[key] = value
+            missing, unexpected = sb3_model.policy.load_state_dict(compatible_state, strict=False)
+            if skipped or missing or unexpected:
+                print("[ppo] Loaded pretrained weights with skipped/missing keys.")
+                if skipped:
+                    print(f"[ppo] Skipped keys (shape or missing): {skipped}")
+                if missing:
+                    print(f"[ppo] Missing keys: {missing}")
+                if unexpected:
+                    print(f"[ppo] Unexpected keys: {unexpected}")
+            else:
+                print(f"[ppo] Successfully loaded pretrained weights from {pretrained_fname}")
+        else:
+            print(f"[ppo] Pretrained file not found: {pretrained_fname}")
 
     print(
         f"[ppo] Training {env_name} for {total_steps} steps "
@@ -462,9 +533,68 @@ def _train_ppo(config, env_class, datafile, total_steps):
     if eval_callback is not None:
         print(
             f"[ppo] Validation enabled: val_data_file={val_datafile}, "
-            f"eval_freq={max(1, n_steps)} (matches rollout collection frequency)"
+            f"eval_freq={max(1, n_steps)} (matches rollout collection frequency), "
+            f"n_eval_episodes={n_eval_episodes}"
         )
-    sb3_model.learn(total_steps, log_interval=1, callback=eval_callback)
+    # Create a callback that records per-rollout scalars to TensorBoard.
+    class PerRolloutTensorboardCallback(BaseCallback):
+        def __init__(self, verbose=0):
+            super().__init__(verbose)
+
+        def _on_step(self) -> bool:
+            # Required abstract implementation; do nothing per step.
+            return True
+
+        def _on_rollout_end(self) -> None:
+            # Try to copy a selection of train/rollout/eval scalars into a
+            # custom namespace so they appear reliably in TensorBoard.
+            try:
+                name_to_value = getattr(self.logger, 'name_to_value', {})
+            except Exception:
+                name_to_value = {}
+
+            tags = [
+                'train/entropy_loss',
+                'train/explained_variance',
+                'train/loss',
+                'train/learning_rate',
+                'rollout/ep_rew_mean',
+                'rollout/ep_len_mean',
+                'eval/mean_reward',
+                'time/fps',
+            ]
+            for tag in tags:
+                val = name_to_value.get(tag)
+                if val is not None:
+                    # map slashes to underscores under custom/ namespace
+                    safe_tag = tag.replace('/', '_')
+                    self.logger.record(f'custom/{safe_tag}', float(val))
+
+            # Additionally, if the model has an episode info buffer, compute
+            # and log mean episode reward/length from it (more reliable).
+            try:
+                ep_buf = getattr(self.model, 'ep_info_buffer', None)
+                if ep_buf is not None and len(ep_buf) > 0:
+                    import numpy as _np
+                    rewards = [e.get('r') for e in ep_buf if 'r' in e]
+                    lengths = [e.get('l') for e in ep_buf if 'l' in e]
+                    if rewards:
+                        self.logger.record('custom/ep_info_mean_reward', float(_np.mean(rewards)))
+                    if lengths:
+                        self.logger.record('custom/ep_info_mean_length', float(_np.mean(lengths)))
+            except Exception:
+                pass
+            # Flush to ensure values are written out
+            try:
+                self.logger.dump(self.num_timesteps)
+            except Exception:
+                pass
+
+    step_cb = PerRolloutTensorboardCallback()
+    cb = CallbackList([c for c in (eval_callback, step_cb) if c is not None])
+
+    # Pass tb_log_name so TensorBoard groups logs under a readable run name.
+    sb3_model.learn(total_steps, log_interval=1, callback=cb, tb_log_name=tb_name)
 
     save_path = config['train']['save_model_path']
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
