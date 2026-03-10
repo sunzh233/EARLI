@@ -1,3 +1,22 @@
+#!/usr/bin/env bash
+
+CUOPT_LOCAL_LIB="/home/sunzh/cuopt/cpp/build"
+CUOPT_DEV_LIB="/home/cslabuser/miniconda3/envs/cuopt_dev_szh/lib"
+CUOPT_PREFIX=""
+if [[ -d "${CUOPT_LOCAL_LIB}" ]]; then
+    CUOPT_PREFIX="${CUOPT_LOCAL_LIB}"
+fi
+if [[ -d "${CUOPT_DEV_LIB}" ]]; then
+    if [[ -n "${CUOPT_PREFIX}" ]]; then
+        CUOPT_PREFIX="${CUOPT_PREFIX}:${CUOPT_DEV_LIB}"
+    else
+        CUOPT_PREFIX="${CUOPT_DEV_LIB}"
+    fi
+fi
+if [[ -n "${CUOPT_PREFIX}" ]]; then
+    export LD_LIBRARY_PATH="${CUOPT_PREFIX}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 PY=/home/cslabuser/miniconda3/envs/earli_env/bin/python
 $PY - <<'PY'
 import os
@@ -9,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 root = Path('/home/sunzh/EARLI')
-py = '/home/cslabuser/miniconda3/envs/earli_env/bin/python'
+py = '/home/cslabuser/miniconda3/envs/cuopt_dev_szh/bin/python'
 
 dataset = 'datasets/vrptw_homberger_like_curriculum/vrptw_test_homberger_200.pkl'
 models = [
@@ -42,8 +61,10 @@ for size, model in models:
         rl_logs = pickle.load(f)
     returns = np.asarray(rl_logs.get('returns', []), dtype=float)
     total_games = int(rl_logs.get('total_games', len(returns)))
-    clock_total = float(rl_logs.get('game_clocktime', 0.0) or 0.0)
-    rl_runtime = clock_total / max(total_games, 1)
+    # Prefer mean_game_clocktime if available; otherwise fall back to game_clocktime.
+    # Note: these fields are already a per-game (per-problem) average, do NOT divide by total_games.
+    clock_mean = float(rl_logs.get('mean_game_clocktime', rl_logs.get('game_clocktime', 0.0)) or 0.0)
+    rl_runtime = clock_mean
     rl_mean_reward = float(np.mean(returns)) if returns.size else np.nan
 
     init_cfg_path = Path(f'/tmp/config_init_h200_m{size}_15s.yaml')
@@ -59,7 +80,7 @@ for size, model in models:
     init_cfg['paths']['solutions'] = str(rl_log_path)
     init_cfg['paths']['out_summary'] = 'test_summary_h200_15s'
 
-    init_cfg.setdefault('cuopt', {})['runtimes'] = [15]
+    init_cfg.setdefault('cuopt', {})['runtimes'] = [15, 30, 45]
     init_cfg['cuopt']['repetitions'] = 1
 
     init_cfg.setdefault('injection', {})['rl_runtime'] = float(rl_runtime)

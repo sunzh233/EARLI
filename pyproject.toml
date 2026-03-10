@@ -41,9 +41,6 @@ dependencies = [
   "pyyaml==6.0.3",
   "wandb==0.22.1",
 
-  # cuOpt SDK — align to env.yaml (25.8.*) and let it pull RAPIDS/CUDA bits
-  "cuopt-cu12==25.8.*",
-
   # build helper + your HGS repo
   "ninja>=1.11",
   "hygese @ git+https://gitlab.com/igreenberg/initializable_hgs.git",

@@ -232,7 +232,7 @@ class RoutingBase(GymEnv, VecEnv):
         Resets the environment. This environment might be used with different decoders.
         In case of using with beam-search decoder, we need to have to increase
         the rows of the mask by a factor of beam_width.
-        indices is a list of size num_envs of True\False
+        indices is a list of size num_envs of True/False
         '''
         if seed is not None:
             seed_all(seed)

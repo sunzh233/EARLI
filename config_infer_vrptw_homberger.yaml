@@ -21,11 +21,11 @@ train:
   block_decreasing_action: false
   epochs: 0
   batch_size: 64
-  n_beams: 16
+  n_beams: 8
   pretrained_fname: "outputs/vrptw_model_homberger_800.m"
   pretrained_run: null
   save_model_path: "outputs/vrptw_model_homberger_700.m"
-  n_parallel_problems: 6
+  n_parallel_problems: 12
   learning_rate: 1e-4
 
 eval:

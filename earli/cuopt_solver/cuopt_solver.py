@@ -81,31 +81,72 @@ class CuOptSolver(object):
             distance_matrix = distance_matrix.cpu().numpy()
         n_nodes = distance_matrix.shape[0]
         data_model = routing.DataModel(n_nodes, n_carriers)
+        # Normalize distance matrix to cudf.DataFrame
+        distance_matrix = (
+            distance_matrix.tolist()
+            if not isinstance(distance_matrix, cudf.DataFrame)
+            else distance_matrix
+        )
+        distance_df = cudf.DataFrame(distance_matrix).astype(np.float32)
+        data_model.add_cost_matrix(distance_df)
 
-        # Add cost matrix information
-        distance_matrix = cudf.DataFrame(distance_matrix.tolist()).astype(np.float32)
-        data_model.add_cost_matrix(distance_matrix)
-
-        # Add capacity dimension
-        capacity = cudf.Series(vehicle_capacity)
+        # Normalize capacity to cudf.Series
+        if isinstance(vehicle_capacity, cudf.Series):
+            capacity = vehicle_capacity.astype('int32')
+        else:
+            try:
+                # pandas Series or numpy array or list
+                capacity = cudf.Series(np.asarray(vehicle_capacity, dtype=np.int32))
+            except Exception:
+                capacity = cudf.Series(list(vehicle_capacity)).astype('int32')
         if self.env_type.startswith('pdp'):
             pickup_indices = np.arange(1, n_nodes // 2 +1 ).tolist()
             delivery_indices = np.arange(n_nodes // 2 + 1, n_nodes).tolist()
             data_model.set_order_locations=np.arange(1, 1 + n_nodes // 2).tolist()
-            data_model.set_pickup_delivery_pairs(cudf.Series(pickup_indices), cudf.Series(delivery_indices))
+            data_model.set_pickup_delivery_pairs(cudf.Series(pickup_indices, dtype='int32'), cudf.Series(delivery_indices, dtype='int32'))
 
         if self.env_type.endswith('tw'):
-            data_model.set_vehicle_time_windows(cudf.Series(n_carriers * [t_min[0]]),
-                                                cudf.Series(n_carriers * [t_max[0]]))
-            data_model.set_order_time_windows(cudf.Series(t_min), cudf.Series(t_max))
-            data_model.set_order_service_times(cudf.Series(dt))
+            # t_min, t_max, dt may be lists, numpy arrays, pandas Series or cudf.Series
+            def _to_cudf_series(x, dtype=None):
+                if x is None:
+                    return None
+                if isinstance(x, cudf.Series):
+                    return x if dtype is None else x.astype(dtype)
+                if isinstance(x, pd.Series):
+                    return cudf.Series(x.to_numpy()).astype(dtype) if dtype is not None else cudf.Series(x.to_numpy())
+                return cudf.Series(np.asarray(x)).astype(dtype) if dtype is not None else cudf.Series(np.asarray(x))
+
+            # vehicle windows: scalar per vehicle provided as first element or list-like
+            if t_min is not None and t_max is not None:
+                try:
+                    v_earliest = [t_min[0]] * n_carriers if not isinstance(t_min, (pd.Series, cudf.Series, list, tuple, np.ndarray)) else [t_min[0]] * n_carriers
+                except Exception:
+                    v_earliest = [t_min] * n_carriers
+                try:
+                    v_latest = [t_max[0]] * n_carriers if not isinstance(t_max, (pd.Series, cudf.Series, list, tuple, np.ndarray)) else [t_max[0]] * n_carriers
+                except Exception:
+                    v_latest = [t_max] * n_carriers
+                data_model.set_vehicle_time_windows(_to_cudf_series(v_earliest, dtype='int32'), _to_cudf_series(v_latest, dtype='int32'))
+
+            data_model.set_order_time_windows(_to_cudf_series(t_min, dtype='int32'), _to_cudf_series(t_max, dtype='int32'))
+            if dt is not None:
+                data_model.set_order_service_times(_to_cudf_series(dt, dtype='int32'))
 
         if set_fixed_carriers:
             if self.env_type != 'vrp':
                 warnings.warn('Setting fixed number of vehicles in non-VRP env.')
             data_model.set_min_vehicles(n_carriers)
 
-        data_model.add_capacity_dimension("demand", cudf.Series(demand.astype(np.int32)), capacity)
+        # Ensure demand is a cudf.Series of int32
+        if isinstance(demand, cudf.Series):
+            demand_series = demand.astype('int32')
+        else:
+            try:
+                demand_series = cudf.Series(np.asarray(demand, dtype=np.int32))
+            except Exception:
+                demand_series = cudf.Series([int(x) for x in list(demand)])
+
+        data_model.add_capacity_dimension("demand", demand_series, capacity)
         drop_return_trips_ = [drop_return_trips] * n_carriers
         if last_drop_return_trip is not None:
             drop_return_trips_[-1] = last_drop_return_trip

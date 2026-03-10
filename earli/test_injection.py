@@ -496,7 +496,9 @@ def run_initialization_only(external_solutions, best_cars, best_cost, method):
     accepted = pd.Series(dtype='float')
     actual_runtime = 0
     num_iterations = 0
-    return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations
+    populations = None
+    accepted_column = None
+    return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations, accepted_column
 
 
 def _to_float(x):
@@ -607,43 +609,43 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
     # distance_matrix
     if distance_matrix is None:
         warnings.warn(f'distance_matrix is None for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     try:
         dm = np.asarray(distance_matrix)
     except Exception:
         warnings.warn(f'Invalid distance_matrix for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     if dm.ndim < 2 or dm.shape[0] < 2:
         warnings.warn(f'distance_matrix shape invalid for problem {ind}: {getattr(dm, "shape", None)}')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
 
     # capacity
     if capacity is None:
         warnings.warn(f'capacity is None for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
 
     # demands
     if demands_for_solver is None:
         warnings.warn(f'demands_for_solver is None for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     try:
         dem = _as_numpy(demands_for_solver)
     except Exception:
         warnings.warn(f'Invalid demands_for_solver for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     if dem.shape[0] != dm.shape[0]:
         warnings.warn(f'demands length {dem.shape[0]} does not match distance_matrix size {dm.shape[0]} for problem {ind}; skipping')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
 
     # n_carriers
     try:
         n_carriers = int(n_carriers)
         if n_carriers <= 0:
             warnings.warn(f'n_carriers <= 0 for problem {ind}; skipping cuOpt run')
-            return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+            return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     except Exception:
         warnings.warn(f'Invalid n_carriers for problem {ind}; skipping cuOpt run')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
 
     # ensure external_solutions is a list and filter-out invalid entries
     if external_solutions is None:
@@ -700,7 +702,7 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
             t_min=t_min, t_max=t_max, dt=dt)
     except Exception as e:
         warnings.warn(f'Failed to create cuOpt data model for problem {ind}: {e}')
-        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None
+        return False, np.nan, np.nan, [], pd.Series(dtype='float'), 0.0, np.nan, None, None
     
     print(f"Problem {ind}: demand sum={np.sum(_as_numpy(problems['demand'][ind]))} capacity={capacity} n_carriers={n_carriers} ")
 
@@ -711,17 +713,73 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
         actual_runtime = time.time() - t0
         if routing_solution is None:
             warnings.warn(f'cuOpt returned None routing_solution for problem {ind}')
-            return False, np.nan, np.nan, [], pd.Series(dtype='float'), actual_runtime, np.nan, None
+            return False, np.nan, np.nan, [], pd.Series(dtype='float'), actual_runtime, np.nan, None, None
         success = routing_solution.get_status() == 0
         vehicle_count = routing_solution.get_vehicle_count()
         cost = CUOPT_NORMALIZATION * routing_solution.get_total_objective()
         solution = convert_cuopt_solution(routing_solution)
         accepted = routing_solution.get_accepted_solutions()
+        # DEBUG: inspect accepted object to catch non-cudf types causing downstream failures
+        try:
+            print("DEBUG: accepted type:", type(accepted))
+            if isinstance(accepted, dict):
+                print("DEBUG: accepted dict value types:", {k: type(v) for k, v in accepted.items()})
+            else:
+                # try to inspect .values() if present
+                vals = None
+                try:
+                    vals = accepted.values()
+                except Exception:
+                    vals = None
+                if vals is not None:
+                    try:
+                        print("DEBUG: accepted values types:", [type(v) for v in vals])
+                    except Exception:
+                        print("DEBUG: accepted values repr failed")
+        except Exception as _e:
+            print("DEBUG: inspecting accepted failed:", _e)
+
+        # Produce both a pandas.Series for existing logic and a cudf Column for APIs that require Column
+        accepted_pandas = None
+        accepted_column = None
+        try:
+            if isinstance(accepted, cudf.Series):
+                accepted_pandas = accepted.to_pandas()
+                accepted_column = accepted._column
+            elif isinstance(accepted, pd.Series):
+                accepted_pandas = accepted
+                try:
+                    accepted_column = cudf.Series(accepted_pandas)._column
+                except Exception:
+                    accepted_column = None
+            else:
+                # fallback: try to convert iterable to pandas then cudf
+                try:
+                    accepted_pandas = pd.Series(list(accepted)) if accepted is not None else pd.Series(dtype='float')
+                except Exception:
+                    accepted_pandas = pd.Series(dtype='float')
+                try:
+                    accepted_column = cudf.Series(accepted_pandas)._column
+                except Exception:
+                    accepted_column = None
+            # ensure pandas series type for downstream code
+            try:
+                if not isinstance(accepted_pandas, pd.Series):
+                    accepted_pandas = pd.Series(list(accepted_pandas))
+                accepted_pandas = accepted_pandas.astype('int32', errors='ignore')
+            except Exception:
+                pass
+        except Exception as _e:
+            print('DEBUG: failed to normalize accepted:', _e)
+            accepted_pandas = pd.Series(dtype='float')
+            accepted_column = None
+        accepted = accepted_pandas
     except Exception as e:
         warnings.warn(f"Caught a failure in cuOpt: {e}")
         actual_runtime = time.time() - t0
         success, vehicle_count, cost, solution = False, np.nan, np.nan, []
         accepted = pd.Series(dtype='float')
+        accepted_column = None
         populations = None
 
     num_iterations = np.nan
@@ -731,7 +789,7 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
                                  demands_for_solver=demand_arr, n_customers=distance_np.shape[0] - 1,
                                  return_to_depot=cuopt_config['problem_setup']['last_return_to_depot'])
     print(f"Returning from run_cuopt for problem {ind} with success={success}, vehicles={vehicle_count}, cost={cost:.3f}, runtime={actual_runtime:.2f}s, accepted_solutions={len(accepted)}")
-    return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations
+    return success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations, accepted_column
 
 
 def main(config_path='config_initialization.yaml'):
@@ -891,7 +949,7 @@ def main(config_path='config_initialization.yaml'):
 
                     if ('naive' in method or 'RL' in method) and ga_time == 0:
                         # CASE I: initialization only
-                        success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations = run_initialization_only(
+                        success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations, accepted_column = run_initialization_only(
                             external_solutions, best_cars, best_cost, method)
 
                     else:
@@ -921,7 +979,7 @@ def main(config_path='config_initialization.yaml'):
                                 inj_best_veh = np.nan
                             print(f"[inject] method={method} problem={ind} injecting_solutions={ext_n} inj_best_cost={inj_best_cost:.3f} inj_best_veh={inj_best_veh}")
 
-                        success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations = \
+                        success, vehicle_count, cost, solution, accepted, actual_runtime, num_iterations, populations, accepted_column = \
                             run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind, ga_time, ENV, LAST_RETURN_TO_DEPOT, FIXED_VEHICLES, PULL_FREQ, CUOPT_NORMALIZATION)
 
                     # re-verify solution
