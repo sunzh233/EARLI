@@ -49,6 +49,18 @@ problem_setup:
   time_penalty_late: 1.0
   vehicle_penalty: 50
   unused_capacity_penalty: 0.2
+  use_lagrangian_constraints: true
+  lagrangian_lr: 5e-5
+  lagrangian_ema: 0.05
+  lagrangian_max: 10.0
+  penalty_late_sum: 0.02
+  penalty_late_count: 0.1
+  penalty_masked_ratio: 0.02
+  penalty_pair_blocked: 0.0
+  target_late_sum: 0.0
+  target_late_count: 0.0
+  target_masked_ratio: 0.1
+  target_pair_blocked: 0.0
   spare_numeric_capacity: 0
   single_site_visit: true
 

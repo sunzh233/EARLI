@@ -60,6 +60,19 @@ problem_setup:
   distance_Lp_norm: 2
   vehicle_penalty: 0  # actual penalty = (vehicle_penalty * radius) if minimize_vehicles, else 0
   unused_capacity_penalty: 0
+  # Constraint shaping and lagrangian dual updates (shared by ppo/tree_based)
+  use_lagrangian_constraints: false
+  lagrangian_lr: 1e-4
+  lagrangian_ema: 0.05
+  lagrangian_max: 10.0
+  penalty_late_sum: 0.0
+  penalty_late_count: 0.0
+  penalty_masked_ratio: 0.0
+  penalty_pair_blocked: 0.0
+  target_late_sum: 0.0
+  target_late_count: 0.0
+  target_masked_ratio: 0.0
+  target_pair_blocked: 0.0
   spare_numeric_capacity: 0.1
   single_site_visit: True
 

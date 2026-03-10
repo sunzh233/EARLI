@@ -273,6 +273,11 @@ class PDPTW(VRPTW):
         arrive_all = current_time.unsqueeze(-1) + svc_h + travel_all
         tw_feasible = arrive_all <= due
 
+        selected_due = ref_tw[dummy_ind, visit_site, 1]
+        lateness = torch.clamp(current_time - selected_due, min=0.0)
+        lateness = torch.where(active_env, lateness, torch.zeros_like(lateness))
+        late_count = (lateness > 0).float()
+
         # For deliveries: feasible only if paired pickup is done.
         # Vectorised: for each delivery node j in env b, look up whether
         # pickup_done[b, pair_of[b, j]] is True.
@@ -291,6 +296,55 @@ class PDPTW(VRPTW):
 
         # Delivery feasible only if pickup already done
         delivery_feasible = (~ref_is_delivery) | pair_pickup_done
+
+        candidate_nodes = (0 < demand) & (demand <= capacity.unsqueeze(-1))
+        candidate_nodes[:, DEPOT_LOCATION] = False
+        masked_by_tw = candidate_nodes & (~tw_feasible)
+        candidate_count = candidate_nodes.float().sum(dim=-1).clamp(min=1.0)
+        masked_ratio = masked_by_tw.float().sum(dim=-1) / candidate_count
+        masked_ratio = torch.where(active_env, masked_ratio, torch.zeros_like(masked_ratio))
+
+        delivery_candidates = candidate_nodes & ref_is_delivery
+        blocked_delivery = delivery_candidates & (~pair_pickup_done)
+        delivery_candidate_count = delivery_candidates.float().sum(dim=-1)
+        blocked_ratio = torch.zeros_like(masked_ratio)
+        has_delivery_candidate = delivery_candidate_count > 0
+        blocked_ratio[has_delivery_candidate] = (
+            blocked_delivery.float().sum(dim=-1)[has_delivery_candidate]
+            / delivery_candidate_count[has_delivery_candidate]
+        )
+        blocked_ratio = torch.where(active_env, blocked_ratio, torch.zeros_like(blocked_ratio))
+
+        constraint_penalty = (
+            self._constraint_weight('late_sum') * lateness
+            + self._constraint_weight('late_count') * late_count
+            + self._constraint_weight('masked_ratio') * masked_ratio
+            + self._constraint_weight('pair_blocked') * blocked_ratio
+        )
+
+        reward_flat = reward.view(-1)
+        reward_flat[active_env] -= constraint_penalty[active_env]
+        acc_returns[active_env] -= constraint_penalty[active_env]
+
+        active_mask = active_env.nonzero(as_tuple=False).squeeze(-1)
+        if active_mask.numel() > 0:
+            self._maybe_update_lagrangian('late_sum', lateness[active_mask])
+            self._maybe_update_lagrangian('late_count', late_count[active_mask])
+            self._maybe_update_lagrangian('masked_ratio', masked_ratio[active_mask])
+            self._maybe_update_lagrangian('pair_blocked', blocked_ratio[active_mask])
+
+        info.update({
+            'late_sum': lateness,
+            'late_count': late_count,
+            'masked_ratio': masked_ratio,
+            'pair_blocked_ratio': blocked_ratio,
+            'constraint_penalty': constraint_penalty,
+            'lagrangian_lambda_late_sum': self.lagrangian_state['late_sum']['lambda'],
+            'lagrangian_lambda_late_count': self.lagrangian_state['late_count']['lambda'],
+            'lagrangian_lambda_masked_ratio': self.lagrangian_state['masked_ratio']['lambda'],
+            'lagrangian_lambda_pair_blocked': self.lagrangian_state['pair_blocked']['lambda'],
+        })
+
         # Pickup feasible without additional constraint (capacity handled below)
         self.feasible_nodes = (
             (0 < self.demand) & (self.demand <= self.capacity)

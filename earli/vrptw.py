@@ -56,6 +56,51 @@ class VRPTW(VRP):
                 self.unused_capacity_penalty = self.config['problem_setup']['unused_capacity_penalty']
                 self.unused_capacity_penalty *= self.radius * self.reward_normalization
 
+        self._init_constraint_penalty_state()
+
+    def _init_constraint_penalty_state(self):
+        ps = self.config.get('problem_setup', {})
+
+        self.use_lagrangian_constraints = bool(ps.get('use_lagrangian_constraints', False))
+        self.lagrangian_lr = float(ps.get('lagrangian_lr', 1e-4))
+        self.lagrangian_ema = float(ps.get('lagrangian_ema', 0.05))
+        self.lagrangian_max = float(ps.get('lagrangian_max', 10.0))
+
+        self.fixed_constraint_penalties = {
+            'late_sum': float(ps.get('penalty_late_sum', 0.0)),
+            'late_count': float(ps.get('penalty_late_count', 0.0)),
+            'masked_ratio': float(ps.get('penalty_masked_ratio', 0.0)),
+            'pair_blocked': float(ps.get('penalty_pair_blocked', 0.0)),
+        }
+
+        self.constraint_targets = {
+            'late_sum': float(ps.get('target_late_sum', 0.0)),
+            'late_count': float(ps.get('target_late_count', 0.0)),
+            'masked_ratio': float(ps.get('target_masked_ratio', 0.0)),
+            'pair_blocked': float(ps.get('target_pair_blocked', 0.0)),
+        }
+
+        self.lagrangian_state = {
+            k: {'lambda': 0.0, 'ema': 0.0}
+            for k in self.fixed_constraint_penalties
+        }
+
+    def _constraint_weight(self, name):
+        lam = self.lagrangian_state[name]['lambda']
+        return self.fixed_constraint_penalties[name] + lam
+
+    def _maybe_update_lagrangian(self, name, signal):
+        if not self.use_lagrangian_constraints or self.env_type != 'train':
+            return
+        if signal.numel() == 0:
+            return
+
+        signal_mean = float(signal.detach().float().mean().item())
+        state = self.lagrangian_state[name]
+        state['ema'] = (1.0 - self.lagrangian_ema) * state['ema'] + self.lagrangian_ema * signal_mean
+        dual_grad = state['ema'] - self.constraint_targets[name]
+        state['lambda'] = float(np.clip(state['lambda'] + self.lagrangian_lr * dual_grad, 0.0, self.lagrangian_max))
+
     # ------------------------------------------------------------------
     # Space setup
     # ------------------------------------------------------------------
@@ -247,6 +292,45 @@ class VRPTW(VRP):
         travel_all = distance_matrix[dummy_ind, head, :]   # (n, n_nodes) all travel times
         arrive_all = current_time.unsqueeze(-1) + svc_h + travel_all
         tw_feasible = arrive_all <= due                    # (n, n_nodes)
+
+        # Soft constraint signals (used for reward shaping and lagrangian updates)
+        selected_due = ref_tw[dummy_ind, visit_site, 1]
+        lateness = torch.clamp(current_time - selected_due, min=0.0)
+        lateness = torch.where(active_env, lateness, torch.zeros_like(lateness))
+        late_count = (lateness > 0).float()
+
+        candidate_nodes = (0 < demand) & (demand <= capacity.unsqueeze(-1))
+        candidate_nodes[:, DEPOT_LOCATION] = False
+        masked_by_tw = candidate_nodes & (~tw_feasible)
+        candidate_count = candidate_nodes.float().sum(dim=-1).clamp(min=1.0)
+        masked_ratio = masked_by_tw.float().sum(dim=-1) / candidate_count
+        masked_ratio = torch.where(active_env, masked_ratio, torch.zeros_like(masked_ratio))
+
+        constraint_penalty = (
+            self._constraint_weight('late_sum') * lateness
+            + self._constraint_weight('late_count') * late_count
+            + self._constraint_weight('masked_ratio') * masked_ratio
+        )
+
+        reward_flat = reward.view(-1)
+        reward_flat[active_env] -= constraint_penalty[active_env]
+        acc_returns[active_env] -= constraint_penalty[active_env]
+
+        active_mask = active_env.nonzero(as_tuple=False).squeeze(-1)
+        if active_mask.numel() > 0:
+            self._maybe_update_lagrangian('late_sum', lateness[active_mask])
+            self._maybe_update_lagrangian('late_count', late_count[active_mask])
+            self._maybe_update_lagrangian('masked_ratio', masked_ratio[active_mask])
+
+        info.update({
+            'late_sum': lateness,
+            'late_count': late_count,
+            'masked_ratio': masked_ratio,
+            'constraint_penalty': constraint_penalty,
+            'lagrangian_lambda_late_sum': self.lagrangian_state['late_sum']['lambda'],
+            'lagrangian_lambda_late_count': self.lagrangian_state['late_count']['lambda'],
+            'lagrangian_lambda_masked_ratio': self.lagrangian_state['masked_ratio']['lambda'],
+        })
 
         self.feasible_nodes = (
             (0 < self.demand) & (self.demand <= self.capacity) & tw_feasible.view_as(self.demand)
