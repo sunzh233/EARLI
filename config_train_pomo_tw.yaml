@@ -39,9 +39,6 @@ train:
   save_model_path: "outputs/vrptw_model_pomo_tw.m"
   n_parallel_problems: 16   # base problems per iteration (× n_augments in practice)
   learning_rate: 1e-4
-  clip_range: 0.2       # PPO clipping coefficient
-  vf_coef: 0.5          # value-function loss coefficient
-  n_ppo_epochs: 1       # gradient epochs per collected batch
 
 pomo_tw:
   n_augments: 8         # number of coordinate augmentations (1/2/4/8)

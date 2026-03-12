@@ -562,9 +562,6 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
         print(f"[pomo_tw] Loaded pretrained weights from {pretrained}")
 
     data_steps = config['muzero']['data_steps_per_epoch']
-    clip_range  = float(config['train'].get('clip_range', 0.2))
-    value_coef  = float(config['train'].get('vf_coef', 0.5))
-    n_ppo_epochs = int(config['train'].get('n_ppo_epochs', 1))
 
     tb_dir = config.get('system', {}).get('tensorboard_logdir', 'outputs/tensorboard')
     default_tb_name = (f"earli_pomo_tw_"
@@ -626,7 +623,6 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
                                // aug_config['train']['n_parallel_problems'])
             all_obs: list = []
             all_actions: list = []
-            all_logps: list = []
             all_returns: list = []
             all_groups: list = []
             aug_best_returns: list = []
@@ -653,7 +649,6 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
 
                 all_obs.append(td['observations'])
                 all_actions.append(td['actions'])
-                all_logps.append(td['log_prob'])
                 all_returns.append(td['returns'])
                 all_groups.append(group_expanded)
 
@@ -674,7 +669,6 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
 
         obs_cat     = torch.cat(all_obs)
         actions_cat = torch.cat(all_actions)
-        logps_cat   = torch.cat(all_logps)
         returns_cat = torch.cat(all_returns).float()
         groups_cat  = torch.cat(all_groups)
 
@@ -693,36 +687,29 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
         advantage = returns_cat - baseline
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-        # ---- PPO / REINFORCE gradient update ----
+        # ---- REINFORCE gradient update ----
+        # POMO uses a pure policy-gradient update — no critic/value network.
+        # The shared baseline (mean return per augmentation group) already
+        # provides variance reduction; no PPO clipping is needed.
         n_samples  = len(obs_cat)
         batch_size = min(config['train']['batch_size'], n_samples)
         model.train()
-        for _ in range(n_ppo_epochs):
-            indices = torch.randperm(n_samples)
-            for start in range(0, n_samples, batch_size):
-                bidx  = indices[start: start + batch_size]
-                obs_b = obs_cat[bidx].to(device)
-                act_b = actions_cat[bidx].to(device)
-                olp_b = logps_cat[bidx].to(device).float()
-                adv_b = advantage[bidx].to(device)
-                ret_b = returns_cat[bidx].to(device)
+        indices = torch.randperm(n_samples)
+        for start in range(0, n_samples, batch_size):
+            bidx  = indices[start: start + batch_size]
+            obs_b = obs_cat[bidx].to(device)
+            act_b = actions_cat[bidx].to(device)
+            adv_b = advantage[bidx].to(device)
 
-                values, new_log_prob, entropy = model.evaluate_actions(obs_b, act_b)
-                values = values.squeeze(-1).float()
+            # evaluate_actions returns (values, log_prob, entropy); values are
+            # not needed because POMO uses a group-mean baseline, not a critic.
+            _, new_log_prob, _ = model.evaluate_actions(obs_b, act_b)
+            loss = -(new_log_prob.float() * adv_b).mean()
 
-                log_ratio = new_log_prob.float() - olp_b
-                ratio     = log_ratio.exp()
-                surr1 = ratio * adv_b
-                surr2 = ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * adv_b
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                value_loss  = F.mse_loss(values, ret_b)
-                loss        = policy_loss + value_coef * value_loss
-
-                model.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                model.optimizer.step()
+            model.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            model.optimizer.step()
 
         model.eval()
 

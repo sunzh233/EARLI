@@ -1365,9 +1365,6 @@ class TestPomoTWTraining:
         cfg['system']['compatibility_mode'] = None
         cfg['train']['method'] = 'pomo_tw'
         cfg['train']['n_beams'] = 1
-        cfg['train']['clip_range'] = 0.2
-        cfg['train']['vf_coef'] = 0.5
-        cfg['train']['n_ppo_epochs'] = 1
         cfg['muzero']['max_moves'] = 50
         cfg['muzero']['data_steps_per_epoch'] = 4
         cfg['pomo_tw'] = {'n_augments': 2}  # small for fast tests
