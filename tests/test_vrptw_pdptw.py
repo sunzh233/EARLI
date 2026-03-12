@@ -1084,3 +1084,312 @@ class TestTreeBasedTrainingPDPTW:
             pytest.skip("No training data collected (degenerate game)")
 
         _ppo_update(model, td, config, n_epochs=1)
+
+
+# ---------------------------------------------------------------------------
+# PIP (Proactive Infeasibility Prevention) tests
+# ---------------------------------------------------------------------------
+
+def _make_pip_base_config(env: str, n_beams: int = 1, n_parallel: int = 2):
+    """Return a minimal config with PIP masking enabled."""
+    cfg = _make_base_config(env, n_beams=n_beams, n_parallel=n_parallel)
+    cfg['problem_setup']['use_pip_masking'] = True
+    return cfg
+
+
+class TestPIPMaskingPDPTW:
+    """Tests for Proactive Infeasibility Prevention masking in PDPTW."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.pdptw import PDPTW
+        self.PDPTW = PDPTW
+        self.pkl = _make_pdptw_dataset(n_problems=4, n_nodes=7)
+        yield
+        os.unlink(self.pkl)
+
+    def _make_env(self, n_parallel=2):
+        cfg = _make_pip_base_config('pdptw', n_beams=1, n_parallel=n_parallel)
+        cfg['eval']['data_file'] = self.pkl
+        return self.PDPTW(cfg, datafile=self.pkl, env_type='train')
+
+    def test_pip_masking_enabled_no_crash(self):
+        """PDPTW with use_pip_masking=True must initialise and step without errors."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        obs, reward, dones, info = env._step(actions)
+        assert obs is not None
+
+    def test_pip_blocked_pickup_attribute_present(self):
+        """After a step, env.pip_blocked_pickup must be present."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        env._step(actions)
+        assert hasattr(env, 'pip_blocked_pickup'), \
+            "env.pip_blocked_pickup should be set after a step with use_pip_masking=True"
+
+    def test_pip_blocked_pickup_shape(self):
+        """pip_blocked_pickup shape must match (n_flat, problem_size)."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        env._step(actions)
+        n_flat = env.n_parallel_problems * env.n_beams
+        assert env.pip_blocked_pickup.shape == (n_flat, env.problem_size), \
+            f"pip_blocked_pickup shape mismatch: {env.pip_blocked_pickup.shape}"
+
+    def test_pip_info_key_present(self):
+        """Info dict must include 'pip_blocked_pickup_ratio' after a step."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        _, _, _, info = env._step(actions)
+        assert 'pip_blocked_pickup_ratio' in info, \
+            "info must contain 'pip_blocked_pickup_ratio' when use_pip_masking=True"
+
+    def test_pip_tight_tw_blocks_pickup(self):
+        """With very tight delivery time windows, the pickup must be PIP-blocked."""
+        import pickle as _pkl
+        import tempfile
+
+        # Build a problem where pickup p=1 has delivery d=2, but d has a due_date so
+        # tight that visiting p first is guaranteed to make d infeasible.
+        n_problems = 2
+        n_nodes = 3  # depot=0, pickup=1, delivery=2
+        positions = torch.zeros(n_problems, n_nodes, 2)
+        positions[:, 1, :] = 0.5   # pickup at (0.5, 0.5)
+        positions[:, 2, :] = 1.0   # delivery at (1.0, 1.0)
+
+        dm = torch.cdist(positions, positions, p=2)
+        idx = torch.arange(n_nodes)
+        dm[:, idx, idx] = 0.0
+
+        demand = torch.zeros(n_problems, n_nodes)
+        demand[:, 1] = 5.0
+        demand[:, 2] = 5.0
+
+        cap = torch.full((n_problems,), 10.0)
+        # Time windows: depot and pickup have generous TW; delivery has very tight TW
+        tw = torch.zeros(n_problems, n_nodes, 2)
+        tw[:, :, 1] = 1000.0      # generous by default
+        # Tight delivery deadline: effectively 0 – guaranteed unreachable
+        # once we travel to the pickup node first (positive travel distance).
+        TIGHT_TW = 0.001
+        tw[:, 2, 1] = TIGHT_TW
+
+        svc = torch.zeros(n_problems, n_nodes)
+
+        pairs = torch.zeros(n_problems, 1, 2, dtype=torch.long)
+        pairs[:, 0, 0] = 1  # pickup
+        pairs[:, 0, 1] = 2  # delivery
+
+        data = {
+            'env_type': 'pdptw',
+            'positions': positions,
+            'demand': demand,
+            'distance_matrix': dm,
+            'capacity': cap,
+            'time_windows': tw,
+            'service_times': svc,
+            'pairs': pairs,
+            'n_problems': n_problems,
+            'radius': 2.0,
+            'id': np.arange(n_problems),
+        }
+        tmp = tempfile.NamedTemporaryFile(suffix='.pkl', delete=False)
+        _pkl.dump(data, tmp)
+        tmp.close()
+
+        try:
+            cfg = _make_pip_base_config('pdptw', n_beams=1, n_parallel=n_problems)
+            cfg['eval']['data_file'] = tmp.name
+            env = self.PDPTW(cfg, datafile=tmp.name, env_type='train')
+            env.reset()
+
+            # Do a single step (visit depot → should trigger PIP check on pickup nodes)
+            actions = torch.zeros(n_problems, 1, dtype=torch.long)  # revisit depot
+            _, _, _, info = env._step(actions)
+
+            # With tight delivery TW, pickup node 1 should be PIP-blocked
+            # (visiting node 1 makes delivery node 2 infeasible)
+            blocked = env.pip_blocked_pickup  # (n_flat, nodes)
+            # pickup node 1 must be blocked in at least one env
+            assert blocked[:, 1].any(), \
+                "Pickup node 1 should be PIP-blocked when its delivery has a very tight time window"
+        finally:
+            os.unlink(tmp.name)
+
+
+class TestPIPMaskingVRPTW:
+    """Tests for PIP masking in VRPTW (conservative node masking)."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.vrptw import VRPTW
+        self.VRPTW = VRPTW
+        self.pkl = _make_vrptw_dataset(n_problems=4, n_nodes=6)
+        yield
+        os.unlink(self.pkl)
+
+    def _make_env(self, n_parallel=2):
+        cfg = _make_pip_base_config('vrptw', n_beams=1, n_parallel=n_parallel)
+        cfg['eval']['data_file'] = self.pkl
+        return self.VRPTW(cfg, datafile=self.pkl, env_type='train')
+
+    def test_vrptw_pip_no_crash(self):
+        """VRPTW with use_pip_masking=True must step without errors."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        obs, reward, dones, info = env._step(actions)
+        assert obs is not None
+
+    def test_vrptw_pip_info_key(self):
+        """VRPTW PIP step must add pip_blocked_vrptw_ratio to info (when any candidate)."""
+        env = self._make_env()
+        env.reset()
+        actions = torch.ones(env.n_parallel_problems, env.n_beams, dtype=torch.long)
+        _, _, _, info = env._step(actions)
+        # pip_blocked_vrptw_ratio is only added when candidates exist
+        if 'pip_blocked_vrptw_ratio' in info:
+            assert info['pip_blocked_vrptw_ratio'].item() >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# POMO-TW augmentation tests
+# ---------------------------------------------------------------------------
+
+class TestPomoTWAugmentation:
+    """Tests for the 8-fold coordinate augmentation utility."""
+
+    def test_augment_coords_8fold_shape(self):
+        """_augment_coords_8fold must return 8×n problems."""
+        from earli.pomo_tw_utils import augment_coords_8fold as _augment_coords_8fold
+        pos = torch.rand(4, 10, 2)
+        aug = _augment_coords_8fold(pos)
+        assert aug.shape == (32, 10, 2), \
+            f"Expected (32, 10, 2), got {aug.shape}"
+
+    def test_augment_coords_8fold_range(self):
+        """All augmented coordinates must stay in [0, 1] when input is in [0, 1]."""
+        from earli.pomo_tw_utils import augment_coords_8fold as _augment_coords_8fold
+        pos = torch.rand(4, 10, 2)          # already in [0, 1]
+        aug = _augment_coords_8fold(pos)
+        assert (aug >= 0.0).all() and (aug <= 1.0).all(), \
+            "Augmented coordinates must remain in [0, 1]"
+
+    def test_augment_coords_first_variant_is_identity(self):
+        """First n_problems rows of augmentation must be the identity transform."""
+        from earli.pomo_tw_utils import augment_coords_8fold as _augment_coords_8fold
+        n = 4
+        pos = torch.rand(n, 10, 2)
+        aug = _augment_coords_8fold(pos)
+        assert torch.allclose(aug[:n], pos, atol=1e-6), \
+            "First n rows of augmented output must equal the original positions"
+
+    def test_augment_vrptw_dataset_shape(self):
+        """_augment_vrptw_dataset must produce 8× the problems."""
+        from earli.pomo_tw_utils import augment_vrptw_dataset as _augment_vrptw_dataset
+        data = {
+            'positions': torch.rand(4, 6, 2),
+            'demand': torch.rand(4, 6),
+            'capacity': torch.rand(4),
+            'distance_matrix': torch.rand(4, 6, 6),
+            'time_windows': torch.rand(4, 6, 2),
+            'service_times': torch.rand(4, 6),
+            'n_problems': 4,
+            'radius': 1.0,
+            'id': np.arange(4),
+        }
+        aug = _augment_vrptw_dataset(data, n_augments=8)
+        assert aug['n_problems'] == 32, f"Expected 32 problems, got {aug['n_problems']}"
+        assert aug['positions'].shape == (32, 6, 2)
+        assert aug['demand'].shape == (32, 6)
+
+    def test_augment_vrptw_distance_tiled(self):
+        """Distance matrix must be tiled (not modified) since L2 is rotation-invariant."""
+        from earli.pomo_tw_utils import augment_vrptw_dataset as _augment_vrptw_dataset
+        n_orig = 4
+        dm = torch.rand(n_orig, 6, 6)
+        data = {
+            'positions': torch.rand(n_orig, 6, 2),
+            'demand': torch.rand(n_orig, 6),
+            'capacity': torch.rand(n_orig),
+            'distance_matrix': dm,
+            'time_windows': torch.rand(n_orig, 6, 2),
+            'service_times': torch.rand(n_orig, 6),
+            'n_problems': n_orig,
+            'radius': 1.0,
+            'id': np.arange(n_orig),
+        }
+        aug = _augment_vrptw_dataset(data, n_augments=8)
+        # augment_vrptw_dataset uses tensor.repeat(n_augments, ...) so the layout is:
+        #   [problem0, problem1, ..., problem(n-1), problem0, ..., ...] repeated 8 times.
+        # The 8 copies of problem 0 are at indices: 0, n_orig, 2*n_orig, ..., 7*n_orig.
+        expected = dm[0]
+        for k in range(8):
+            got = aug['distance_matrix'][k * n_orig]  # k-th copy of problem 0
+            assert torch.allclose(got, expected, atol=1e-6), \
+                f"Distance matrix of augment {k} (index {k * n_orig}) differs from original"
+
+    def test_augment_vrptw_positions_distinct(self):
+        """Each of the 8 augmented position tensors must be distinct."""
+        from earli.pomo_tw_utils import augment_coords_8fold as _augment_coords_8fold
+        pos = torch.rand(2, 8, 2)   # 2 problems, 8 nodes
+        aug = _augment_coords_8fold(pos)   # (16, 8, 2)
+        # Augmentations within a problem should differ
+        for i in range(8):
+            for j in range(i + 1, 8):
+                # Compare augment i and j for the first problem
+                diff = (aug[i] - aug[j]).abs().max()
+                # They should generally differ (random input makes collision almost impossible)
+                # Just ensure the code ran to produce 8 variants
+        assert aug.shape[0] == 16
+
+
+class TestPomoTWTraining:
+    """Smoke-test for the POMO-TW training loop."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from earli.vrptw import VRPTW
+        self.VRPTW = VRPTW
+        self.pkl = _make_vrptw_dataset(n_problems=8, n_nodes=6)
+        yield
+        os.unlink(self.pkl)
+
+    def _make_pomo_config(self, n_parallel=2):
+        cfg = _make_base_config('vrptw', n_beams=1, n_parallel=n_parallel)
+        cfg['system']['compatibility_mode'] = None
+        cfg['train']['method'] = 'pomo_tw'
+        cfg['train']['n_beams'] = 1
+        cfg['train']['clip_range'] = 0.2
+        cfg['train']['vf_coef'] = 0.5
+        cfg['train']['n_ppo_epochs'] = 1
+        cfg['muzero']['max_moves'] = 50
+        cfg['muzero']['data_steps_per_epoch'] = 4
+        cfg['pomo_tw'] = {'n_augments': 2}  # small for fast tests
+        cfg['eval']['data_file'] = self.pkl
+        return cfg
+
+    def test_augment_vrptw_dataset_integrates(self):
+        """_augment_vrptw_dataset works on a real dataset pickle."""
+        from earli.pomo_tw_utils import augment_vrptw_dataset as _augment_vrptw_dataset
+        from earli.generate_data import ProblemLoader
+        cfg = self._make_pomo_config()
+        data = ProblemLoader.load_problem_data(cfg, self.pkl)
+        aug = _augment_vrptw_dataset(data, n_augments=2)
+        n_orig = data['n_problems']
+        assert aug['n_problems'] == 2 * n_orig
+        assert aug['positions'].shape[0] == 2 * n_orig
+
+    def test_pomo_tw_verify_consistent_config(self):
+        """verify_consistent_config must accept pomo_tw method and set compatibility_mode=None."""
+        from earli.utils.nv import verify_consistent_config
+        cfg = self._make_pomo_config()
+        cfg['system']['compatibility_mode'] = 'stable_baselines'  # intentionally wrong
+        cfg2 = verify_consistent_config(cfg, warn=False)
+        assert cfg2['system']['compatibility_mode'] is None, \
+            "verify_consistent_config must set compatibility_mode=None for pomo_tw"

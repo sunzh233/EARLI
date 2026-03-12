@@ -72,6 +72,11 @@ class VRPTW(VRP):
         self.lagrangian_ema = float(ps.get('lagrangian_ema', 0.05))
         self.lagrangian_max = float(ps.get('lagrangian_max', 10.0))
 
+        # PIP (Proactive Infeasibility Prevention) masking:
+        # When True, proactively mask actions that would make future nodes permanently
+        # infeasible (e.g., for PDPTW: mask pickup p if delivery d_p becomes unreachable).
+        self.use_pip_masking = bool(ps.get('use_pip_masking', False))
+
         self.fixed_constraint_penalties = {
             'late_sum': float(ps.get('penalty_late_sum', 0.0)),
             'late_count': float(ps.get('penalty_late_count', 0.0)),
@@ -410,6 +415,50 @@ class VRPTW(VRP):
         )
         self.feasible_nodes[..., DEPOT_LOCATION] = True
         self.feasible_nodes.view(-1, self.problem_size)[dummy_ind, head] = False
+
+        # ------------------------------------------------------------------
+        # PIP (Proactive Infeasibility Prevention) for VRPTW:
+        # Optionally mask candidate node j if visiting j would cause at least
+        # one currently-feasible must-visit node k to miss its time window.
+        # The check: after visiting j (time_at_j), can we reach k from j?
+        # Only enabled when use_pip_masking is True (default: False).
+        # ------------------------------------------------------------------
+        if self.use_pip_masking:
+            # Candidate nodes: demand > 0, within capacity, TW feasible, not depot
+            cand = self.feasible_nodes.view(-1, self.problem_size).clone()
+            cand[:, DEPOT_LOCATION] = False
+            if cand.any():
+                ready = ref_tw[:, :, 0]                   # (n, nodes)
+                due   = ref_tw[:, :, 1]                   # (n, nodes)
+                # Arrival time at each candidate j from current head
+                arrive_j = current_time.unsqueeze(-1) + svc_h + travel_all  # (n, nodes)
+                time_at_j_done = torch.max(arrive_j, ready) + ref_svc       # (n, nodes) time after svc at j
+
+                # From j, can we still reach each remaining node k?
+                # (n, nodes_j, nodes_k): travel from j to k
+                travel_j_to_k = distance_matrix  # (n, nodes, nodes)
+                # time_at_j_done[:, j] + travel_j_to_k[:, j, k]  vs due[:, k]
+                # arrive_from_j: (n, nodes_j, nodes_k)
+                arrive_from_j = time_at_j_done.unsqueeze(-1) + travel_j_to_k  # (n, nodes_j, nodes_k)
+                reachable_from_j = arrive_from_j <= due.unsqueeze(-2)          # (n, nodes_j, nodes_k)
+
+                # must_visit: currently feasible non-depot customer nodes
+                must_visit = cand  # (n_flat, nodes_k)
+                # pip_blocked[j]: some must_visit k is reachable from head but NOT from j
+                reachable_from_head = tw_feasible  # (n_flat, nodes_k)
+                # For each j: any k that was reachable but becomes unreachable after j?
+                becomes_infeasible = (reachable_from_head.unsqueeze(-2)
+                                      & ~reachable_from_j
+                                      & must_visit.unsqueeze(-2))  # (n, nodes_j, nodes_k)
+                pip_blocks_others = becomes_infeasible.any(dim=-1)  # (n_flat, nodes_j)
+
+                # Only mask customer (non-depot) nodes
+                pip_blocks_others[:, DEPOT_LOCATION] = False
+                # Apply to feasible_nodes
+                fn_flat = self.feasible_nodes.view(-1, self.problem_size)
+                fn_flat[pip_blocks_others] = False
+                self.feasible_nodes = fn_flat.view_as(self.feasible_nodes)
+                info['pip_blocked_vrptw_ratio'] = pip_blocks_others.float().mean()
 
         dones = self.non_zero_demand.sum(dim=-1) == 0
         if self.last_go_back_to_depot:

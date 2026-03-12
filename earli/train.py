@@ -48,7 +48,6 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env import VecMonitor
-from torch.utils.tensorboard import SummaryWriter
 from yaml import SafeLoader
 
 from .models.attention_model import PosAttentionModel
@@ -59,6 +58,20 @@ from .utils.nv import verify_consistent_config
 from .vrp import VRP
 from .vrptw import VRPTW
 from .pdptw import PDPTW
+from .pomo_tw_utils import augment_coords_8fold, augment_vrptw_dataset
+
+# SummaryWriter is imported lazily inside functions that use it to avoid
+# requiring tensorboard as a hard dependency for all modules.
+_SummaryWriter = None
+
+
+def _get_summary_writer(log_dir):
+    """Lazily import and return a SummaryWriter instance."""
+    global _SummaryWriter
+    if _SummaryWriter is None:
+        from torch.utils.tensorboard import SummaryWriter
+        _SummaryWriter = SummaryWriter
+    return _SummaryWriter(log_dir=log_dir)
 
 ignore_legacy_wandb_warnings()
 
@@ -215,6 +228,14 @@ def _ppo_update(model, training_data, config,
 
 
 # ---------------------------------------------------------------------------
+# POMO-TW utilities (re-exported from pomo_tw_utils for internal convenience)
+# ---------------------------------------------------------------------------
+
+_augment_coords_8fold = augment_coords_8fold
+_augment_vrptw_dataset = augment_vrptw_dataset
+
+
+# ---------------------------------------------------------------------------
 # Tree-based training
 # ---------------------------------------------------------------------------
 
@@ -272,7 +293,7 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
     tb_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     tb_run_dir = os.path.join(tb_dir, f"{tb_name}_{tb_stamp}")
     os.makedirs(tb_run_dir, exist_ok=True)
-    tb_writer = SummaryWriter(log_dir=tb_run_dir)
+    tb_writer = _get_summary_writer(tb_run_dir)
     print(f"[tree_based] TensorBoard run dir: {tb_run_dir}")
 
     logger = logging.getLogger(__name__)
@@ -459,8 +480,286 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
 
 
 # ---------------------------------------------------------------------------
+# POMO-TW training
+# ---------------------------------------------------------------------------
+
+def _train_pomo_tw(config, env_class, datafile, total_epochs):
+    """POMO-TW training loop.
+
+    Implements Policy Optimization with Multiple Optima for Time-Window
+    problems (POMO-TW).  Key ideas from the POMO paper (Kwon et al., 2020):
+
+    1. **Coordinate augmentation** – each problem instance is transformed into
+       *n_augments* equivalent instances by applying rotations and reflections
+       of the 2D node coordinates (all 8 symmetries of the square, or a subset).
+       Because augmentations preserve L2 distances, they define genuinely
+       different search landscapes while sharing the same optimal tour length,
+       which increases training diversity at zero labelling cost.
+
+    2. **Shared REINFORCE baseline** – within each group of augmented instances
+       (derived from the same original problem), the mean return is used as the
+       REINFORCE baseline.  This reduces variance without requiring a separate
+       value network.
+
+    3. **PIP integration** – when ``problem_setup.use_pip_masking: true`` the
+       environment enforces proactive infeasibility prevention (blocking pickup
+       nodes whose paired delivery would become unreachable), making the search
+       more feasibility-aware.
+
+    Parameters
+    ----------
+    config : dict
+        Full training config.  ``train.method`` must be ``'pomo_tw'``.
+    env_class : type
+        Environment class (VRPTW or PDPTW).
+    datafile : str or list[str]
+        Path(s) to the dataset PKL file(s).
+    total_epochs : int
+        Number of training epochs.
+    """
+    import tempfile
+    import pickle
+    from .generate_data import ProblemLoader, MultiSizeDataLoader
+
+    pomo_cfg   = config.get('pomo_tw', {})
+    n_augments = int(pomo_cfg.get('n_augments', 8))
+    assert n_augments in (1, 2, 4, 8), "pomo_tw.n_augments must be 1, 2, 4 or 8"
+
+    env_name   = config['problem_setup']['env'].upper()
+    n_parallel = config['train']['n_parallel_problems']
+    sampler    = Sampler(config)
+
+    # Load base dataset
+    if isinstance(datafile, (list, tuple)):
+        base_data = MultiSizeDataLoader.load_mixed_data(config, datafile)
+    else:
+        base_data = ProblemLoader.load_problem_data(config, datafile)
+
+    n_base = base_data['n_problems']
+
+    # Build augmented config (n_parallel problems × n_augments per problem,
+    # processed together in one batch so the shared baseline can be computed).
+    aug_config = deepcopy(config)
+    aug_config['train']['n_parallel_problems'] = n_parallel * n_augments
+
+    # Build model on a dummy un-augmented environment so the architecture is
+    # determined by the original problem size / feature set.
+    dummy_env = env_class(config, datafile=datafile, env_type='train')
+    obs_space, act_space = dummy_env.spaces
+    model = PosAttentionModel(obs_space, act_space, config=config, sampler=sampler)
+
+    # Load pretrained weights if provided
+    pretrained = config['train'].get('pretrained_fname')
+    if pretrained and os.path.exists(pretrained):
+        checkpoint = torch.load(pretrained, weights_only=False)
+        params = checkpoint.get('model_state_dict', checkpoint)
+        params = {k.replace('._orig_mod', ''): v for k, v in params.items()}
+        missing, unexpected = model.load_state_dict(params, strict=False)
+        if missing:
+            print(f"[pomo_tw] Missing keys from pretrained model: {missing}")
+        if unexpected:
+            print(f"[pomo_tw] Unexpected keys in pretrained model: {unexpected}")
+        print(f"[pomo_tw] Loaded pretrained weights from {pretrained}")
+
+    data_steps = config['muzero']['data_steps_per_epoch']
+    clip_range  = float(config['train'].get('clip_range', 0.2))
+    value_coef  = float(config['train'].get('vf_coef', 0.5))
+    n_ppo_epochs = int(config['train'].get('n_ppo_epochs', 1))
+
+    tb_dir = config.get('system', {}).get('tensorboard_logdir', 'outputs/tensorboard')
+    default_tb_name = (f"earli_pomo_tw_"
+                       f"{os.path.splitext(os.path.basename(config['train']['save_model_path']))[0]}")
+    tb_name = config.get('system', {}).get('run_name') or default_tb_name
+    tb_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tb_run_dir = os.path.join(tb_dir, f"{tb_name}_{tb_stamp}")
+    os.makedirs(tb_run_dir, exist_ok=True)
+    tb_writer = _get_summary_writer(tb_run_dir)
+    print(f"[pomo_tw] TensorBoard run dir: {tb_run_dir}")
+
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"[pomo_tw] Training {env_name} for {total_epochs} epochs "
+        f"({data_steps} base problems/epoch, {n_augments} augments each, "
+        f"{n_parallel} parallel) …"
+    )
+
+    device = next(model.parameters()).device
+
+    for epoch in range(total_epochs):
+        # ---- data collection ----
+        # Sample a batch of base problems and augment them
+        dataset_size = n_base
+        start_idx = (epoch * data_steps) % dataset_size
+        prob_indices = torch.arange(start_idx, start_idx + data_steps) % dataset_size
+
+        # Build augmented dataset for this epoch
+        subset = {k: (v[prob_indices] if isinstance(v, torch.Tensor)
+                       and v.dim() > 0 and v.shape[0] == dataset_size
+                       else (v[prob_indices] if isinstance(v, np.ndarray)
+                              and v.ndim > 0 and v.shape[0] == dataset_size
+                              else v))
+                  for k, v in base_data.items()}
+        subset['n_problems'] = len(prob_indices)
+        aug_data = _augment_vrptw_dataset(subset, n_augments=n_augments)
+
+        # Write augmented data to a temp file (env uses file-based loading)
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as tmp_f:
+            pickle.dump(aug_data, tmp_f)
+            tmp_path = tmp_f.name
+
+        try:
+            aug_config['train']['n_parallel_problems'] = min(
+                n_parallel * n_augments, aug_data['n_problems']
+            )
+            collector = SelfPlay(
+                Game=env_class,
+                config=aug_config,
+                seed=config['train']['seed'] + epoch,
+                env_type='train',
+                n_beams=config['train']['n_beams'],
+                model=model,
+                datafile=tmp_path,
+                n_problems=aug_config['train']['n_parallel_problems'],
+            )
+
+            n_iterations = max(1, (data_steps * n_augments)
+                               // aug_config['train']['n_parallel_problems'])
+            all_obs: list = []
+            all_actions: list = []
+            all_logps: list = []
+            all_returns: list = []
+            all_groups: list = []
+            aug_best_returns: list = []
+
+            for iter_idx in range(n_iterations):
+                _, infos = collector.play_game(deterministic=False, training=True)
+                td = infos.get('training_data')
+                if td is None or len(td) == 0:
+                    continue
+
+                # Per-augmentation group assignment: group by original problem index
+                # (The augmented env runs aug_config['n_parallel_problems'] problems,
+                #  cycling through the n_augments versions of each original problem.)
+                n_batch_probs = aug_config['train']['n_parallel_problems']
+                n_orig = n_batch_probs // n_augments
+                group_ids = torch.arange(n_orig).repeat(n_augments)[:n_batch_probs]
+                # Expand group IDs to match the number of training samples
+                samples_per_prob = max(1, len(td) // n_batch_probs)
+                group_expanded = group_ids.repeat_interleave(samples_per_prob)
+                if len(group_expanded) < len(td):
+                    pad = torch.zeros(len(td) - len(group_expanded), dtype=torch.long)
+                    group_expanded = torch.cat([group_expanded, pad])
+                group_expanded = group_expanded[:len(td)]
+
+                all_obs.append(td['observations'])
+                all_actions.append(td['actions'])
+                all_logps.append(td['log_prob'])
+                all_returns.append(td['returns'])
+                all_groups.append(group_expanded)
+
+                # Best return for logging
+                try:
+                    br = infos.get('best_return')
+                    if br is not None:
+                        aug_best_returns.append(float(np.mean(br)))
+                except Exception:
+                    pass
+
+        finally:
+            os.unlink(tmp_path)
+
+        if not all_obs:
+            logger.warning(f"[pomo_tw] Epoch {epoch}: no training data, skipping update.")
+            continue
+
+        obs_cat     = torch.cat(all_obs)
+        actions_cat = torch.cat(all_actions)
+        logps_cat   = torch.cat(all_logps)
+        returns_cat = torch.cat(all_returns).float()
+        groups_cat  = torch.cat(all_groups)
+
+        # ---- POMO shared-baseline advantage ----
+        # For each group (original problem), compute mean return as baseline.
+        n_groups = int(groups_cat.max().item()) + 1
+        group_mean = torch.zeros(n_groups, dtype=torch.float32)
+        group_count = torch.zeros(n_groups, dtype=torch.float32)
+        for g in range(n_groups):
+            mask_g = groups_cat == g
+            if mask_g.any():
+                group_mean[g] = returns_cat[mask_g].mean()
+                group_count[g] = mask_g.float().sum()
+
+        baseline  = group_mean[groups_cat]
+        advantage = returns_cat - baseline
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        # ---- PPO / REINFORCE gradient update ----
+        n_samples  = len(obs_cat)
+        batch_size = min(config['train']['batch_size'], n_samples)
+        model.train()
+        for _ in range(n_ppo_epochs):
+            indices = torch.randperm(n_samples)
+            for start in range(0, n_samples, batch_size):
+                bidx  = indices[start: start + batch_size]
+                obs_b = obs_cat[bidx].to(device)
+                act_b = actions_cat[bidx].to(device)
+                olp_b = logps_cat[bidx].to(device).float()
+                adv_b = advantage[bidx].to(device)
+                ret_b = returns_cat[bidx].to(device)
+
+                values, new_log_prob, entropy = model.evaluate_actions(obs_b, act_b)
+                values = values.squeeze(-1).float()
+
+                log_ratio = new_log_prob.float() - olp_b
+                ratio     = log_ratio.exp()
+                surr1 = ratio * adv_b
+                surr2 = ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * adv_b
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                value_loss  = F.mse_loss(values, ret_b)
+                loss        = policy_loss + value_coef * value_loss
+
+                model.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                model.optimizer.step()
+
+        model.eval()
+
+        # ---- logging ----
+        mean_best = float(np.mean(aug_best_returns)) if aug_best_returns else None
+        msg = f"[pomo_tw] Epoch {epoch + 1}/{total_epochs}: {n_samples} training samples"
+        if mean_best is not None:
+            msg += f", mean_best_return={mean_best:.4f}"
+        logger.info(msg)
+
+        try:
+            tb_writer.add_scalar('pomo_tw/epoch/training_samples', float(n_samples), epoch + 1)
+            if mean_best is not None:
+                tb_writer.add_scalar('pomo_tw/epoch/mean_best_return', float(mean_best), epoch + 1)
+            if hasattr(model, 'optimizer') and model.optimizer is not None:
+                lr = float(model.optimizer.param_groups[0]['lr'])
+                tb_writer.add_scalar('pomo_tw/epoch/learning_rate', lr, epoch + 1)
+            tb_writer.flush()
+        except Exception:
+            pass
+
+    # ---- save ----
+    save_path = config['train']['save_model_path']
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    torch.save({'model_state_dict': model.state_dict()}, save_path)
+    print(f"[pomo_tw] Model saved to {save_path}")
+    try:
+        tb_writer.close()
+    except Exception:
+        pass
+    return model
+
+
+# ---------------------------------------------------------------------------
 # PPO training (SB3)
 # ---------------------------------------------------------------------------
+
 
 def _train_ppo(config, env_class, datafile, total_steps):
     """Training loop for the ``ppo`` method using Stable-Baselines3.
@@ -816,9 +1115,17 @@ def train(config_path: str, total_steps: int | None = None) -> None:
             total_epochs = max(1, total_steps // max(data_steps, n_parallel))
         _train_tree_based(config, env_class, datafile, total_epochs)
 
+    elif method == 'pomo_tw':
+        total_epochs = config['train']['epochs']
+        if total_steps is not None:
+            data_steps = config['muzero']['data_steps_per_epoch']
+            n_parallel = config['train']['n_parallel_problems']
+            total_epochs = max(1, total_steps // max(data_steps, n_parallel))
+        _train_pomo_tw(config, env_class, datafile, total_epochs)
+
     else:
         raise ValueError(
-            f"Unknown train.method '{method}'. Choose 'ppo' or 'tree_based'."
+            f"Unknown train.method '{method}'. Choose 'ppo', 'tree_based', or 'pomo_tw'."
         )
 
 
@@ -828,7 +1135,8 @@ def main() -> None:
             'Train a VRP/VRPTW/PDPTW RL agent.\n\n'
             'Set train.method in the YAML config to select the training algorithm:\n'
             '  ppo         – Stable-Baselines3 PPO (fast, requires compatibility_mode: stable_baselines)\n'
-            '  tree_based  – Tree-search guided PPO (higher data quality, requires compatibility_mode: null)'
+            '  tree_based  – Tree-search guided PPO (higher data quality, requires compatibility_mode: null)\n'
+            '  pomo_tw     – POMO-TW: augmented multi-start REINFORCE for VRPTW/PDPTW (requires compatibility_mode: null)'
         )
     )
     parser.add_argument(

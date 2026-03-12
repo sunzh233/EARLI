@@ -62,6 +62,10 @@ class PDPTW(VRPTW):
                 self.unused_capacity_penalty = self.config['problem_setup']['unused_capacity_penalty']
                 self.unused_capacity_penalty *= self.radius * self.reward_normalization
 
+        # Initialise PIP / Lagrangian constraint state (inherited from VRPTW but not
+        # called automatically because PDPTW.__init__ bypasses VRPTW.__init__).
+        self._init_constraint_penalty_state()
+
     # ------------------------------------------------------------------
     # Space setup
     # ------------------------------------------------------------------
@@ -80,6 +84,10 @@ class PDPTW(VRPTW):
         # pair_of[i] = pickup index for delivery i (−1 if not a delivery)
         self.ref_pair_of = torch.full([self.n_parallel_problems, self.problem_size], -1,
                                       dtype=torch.long, device=self.device)
+        # delivery_of[i] = delivery index for pickup i (−1 if not a pickup)
+        # Used by the PIP mask to check if visiting pickup p makes delivery d_p infeasible.
+        self.ref_delivery_of = torch.full([self.n_parallel_problems, self.problem_size], -1,
+                                          dtype=torch.long, device=self.device)
 
         # Dynamic: has the pickup of each pair been served?
         self.pickup_done = torch.zeros(
@@ -129,12 +137,14 @@ class PDPTW(VRPTW):
         )
 
         pairs = self.reference['pairs'][fixed_dataset_indices]  # (n, max_pairs, 2)
-        # Build is_pickup, is_delivery, pair_of masks from pair array
+        # Build is_pickup, is_delivery, pair_of, delivery_of masks from pair array
         is_pickup = torch.zeros(n_problems_to_reset, self.problem_size, dtype=torch.bool,
                                 device=self.device)
         is_delivery = torch.zeros_like(is_pickup)
         pair_of = torch.full((n_problems_to_reset, self.problem_size), -1,
                              dtype=torch.long, device=self.device)
+        delivery_of = torch.full((n_problems_to_reset, self.problem_size), -1,
+                                 dtype=torch.long, device=self.device)
 
         for b in range(n_problems_to_reset):
             p = pairs[b]  # (max_pairs, 2)
@@ -145,13 +155,15 @@ class PDPTW(VRPTW):
                     continue  # padding row
                 if pick_idx < self.problem_size:
                     is_pickup[b, pick_idx] = True
+                    delivery_of[b, pick_idx] = delv_idx  # pickup → delivery
                 if delv_idx < self.problem_size:
                     is_delivery[b, delv_idx] = True
-                    pair_of[b, delv_idx] = pick_idx
+                    pair_of[b, delv_idx] = pick_idx  # delivery → pickup
 
         self.ref_is_pickup[indices] = is_pickup
         self.ref_is_delivery[indices] = is_delivery
         self.ref_pair_of[indices] = pair_of
+        self.ref_delivery_of[indices] = delivery_of
         return n
 
     # ------------------------------------------------------------------
@@ -209,12 +221,16 @@ class PDPTW(VRPTW):
             ref_pair_of_flat = (self.ref_pair_of
                                 .unsqueeze(1).expand(-1, self.n_beams, -1)
                                 .reshape(-1, self.problem_size))
+            ref_delivery_of_flat = (self.ref_delivery_of
+                                    .unsqueeze(1).expand(-1, self.n_beams, -1)
+                                    .reshape(-1, self.problem_size))
         else:
             ref_tw = self.ref_time_windows
             ref_svc = self.ref_service_times
             ref_is_pickup = self.ref_is_pickup
             ref_is_delivery = self.ref_is_delivery
             ref_pair_of_flat = self.ref_pair_of
+            ref_delivery_of_flat = self.ref_delivery_of
 
         active_env = actions >= 0
         actions[~active_env] = 0
@@ -362,6 +378,52 @@ class PDPTW(VRPTW):
         )
         self.feasible_nodes[..., DEPOT_LOCATION] = True
         self.feasible_nodes.view(-1, self.problem_size)[dummy_ind, head] = False
+
+        # ------------------------------------------------------------------
+        # PIP (Proactive Infeasibility Prevention) for PDPTW:
+        # For each pickup node p, proactively mask it if visiting p would make
+        # its paired delivery d unreachable within the delivery's time window.
+        # Time check:  max(ct + svc_h + travel[head,p], ready[p]) + svc[p]
+        #              + travel[p, d]  >  due[d]
+        # Only applied when use_pip_masking is True (default False).
+        # ------------------------------------------------------------------
+        pip_blocked_pickup = torch.zeros(n_actions, self.problem_size,
+                                         dtype=torch.bool, device=current_time.device)
+        if self.use_pip_masking and ref_is_pickup.any():
+            safe_delivery = ref_delivery_of_flat.clamp(min=0)  # (n_flat, nodes)
+
+            # Earliest arrival at each node p (including waiting for ready_p)
+            arrive_p = current_time.unsqueeze(-1) + svc_h + distance_matrix[dummy_ind, head, :]
+            ready_p  = ref_tw[:, :, 0]
+            time_at_p_done = torch.max(arrive_p, ready_p) + ref_svc  # (n_flat, nodes) time after service at p
+
+            # Gather travel time from each node p to its paired delivery partner.
+            # distance_matrix: (n_flat, n_nodes, n_nodes)
+            # We need distance_matrix[b, p, delivery_of[b,p]] for every b,p.
+            flat_env = torch.arange(n_actions, device=current_time.device).unsqueeze(-1).expand(n_actions, self.problem_size)
+            flat_node = torch.arange(self.problem_size, device=current_time.device).unsqueeze(0).expand(n_actions, self.problem_size)
+            travel_p_to_d = distance_matrix[flat_env, flat_node, safe_delivery]  # (n_flat, nodes)
+
+            due_d = ref_tw[:, :, 1]                              # (n_flat, nodes) due dates
+            # For each env b and pickup p: time after serving p + travel to delivery
+            arrive_at_d = time_at_p_done + travel_p_to_d        # (n_flat, nodes)
+            # Look up due date of the delivery partner
+            due_of_d = due_d[flat_env, safe_delivery]            # (n_flat, nodes) due[delivery_of[b,p]]
+
+            # Pickup p is PIP-blocked when its delivery would be missed
+            pip_blocked_pickup = ref_is_pickup.bool() & (arrive_at_d > due_of_d)
+
+            # Apply PIP hard mask: block the identified pickup nodes
+            feasible_flat2 = self.feasible_nodes.view(-1, self.problem_size)
+            feasible_flat2[pip_blocked_pickup] = False
+            self.feasible_nodes = feasible_flat2.view_as(self.feasible_nodes)
+
+        # Store PIP diagnostics and add to info
+        self.pip_blocked_pickup = pip_blocked_pickup
+        pickup_candidate_count = (ref_is_pickup.bool() & candidate_nodes).float().sum(dim=-1).clamp(min=1.0)
+        pip_blocked_ratio = pip_blocked_pickup.float().sum(dim=-1) / pickup_candidate_count
+        pip_blocked_ratio = torch.where(active_env, pip_blocked_ratio, torch.zeros_like(pip_blocked_ratio))
+        info['pip_blocked_pickup_ratio'] = pip_blocked_ratio
 
         dones = self.non_zero_demand.sum(dim=-1) == 0
         if self.last_go_back_to_depot:
