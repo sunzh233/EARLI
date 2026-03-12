@@ -82,6 +82,14 @@ def verify_consistent_config(config, warn=True):
                 ('train', 'method'), 'tree_based',
                 ('system', 'use_tensordict'), True)
 
+    # pomo_tw training: same tensor-mode requirements as tree_based
+    if config['train']['method'].lower() == 'pomo_tw':
+        if config['system'].get('compatibility_mode') == 'stable_baselines':
+            set_field(('system', 'compatibility_mode'), None)
+        assert_consistent_property(
+                ('train', 'method'), 'pomo_tw',
+                ('system', 'use_tensordict'), True)
+
     return config
 
 

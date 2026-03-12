@@ -1,0 +1,175 @@
+---
+# POMO-TW training configuration
+#
+# Implements Policy Optimization with Multiple Optima for Time-Window problems.
+# Key features:
+#   - 8-fold coordinate augmentation (4 rotations × 2 reflections)
+#   - REINFORCE with shared baseline across augmented instances
+#   - Optional PIP (Proactive Infeasibility Prevention) masking
+#   - Compatible with VRPTW and PDPTW environments
+#
+# Usage:
+#   python -m earli.train --config config_train_pomo_tw.yaml
+
+system:
+  env_device: cpu
+  model_device: cuda
+  tree_device: cpu
+  buffer_device: cpu
+  save_obs_on_gpu: true
+  use_tensordict: true
+  allow_wandb: false
+  run_name: null
+  no_sweep: false
+  compatibility_mode: null  # must be null for pomo_tw
+
+train:
+  method: "pomo_tw"   # POMO-TW training
+  optimizer: "adam"
+  seed: 0
+  deterministic_algo: false
+  gamma: 1
+  multi_gpu: false
+  block_decreasing_action: false
+  epochs: 50
+  batch_size: 512
+  n_beams: 1            # single beam per augmented copy
+  pretrained_fname: null
+  pretrained_run: null
+  save_model_path: "outputs/vrptw_model_pomo_tw.m"
+  n_parallel_problems: 16   # base problems per iteration (× n_augments in practice)
+  learning_rate: 1e-4
+  clip_range: 0.2       # PPO clipping coefficient
+  vf_coef: 0.5          # value-function loss coefficient
+  n_ppo_epochs: 1       # gradient epochs per collected batch
+
+pomo_tw:
+  n_augments: 8         # number of coordinate augmentations (1/2/4/8)
+
+eval:
+  data_file: datasets/homberger_vrptw_curriculum/vrptw_train_200.pkl
+  val_data_file: datasets/homberger_vrptw_curriculum/vrptw_val_200.pkl
+  max_problems: null
+  apply_local_search: false
+  deterministic_test_beam: true
+  detailed_test_log: false
+  save_full_tree: false
+  naive_greedy: false
+
+problem_setup:
+  env: vrptw    # or 'pdptw' for PDPTW with PIP masking
+  problem_range: null
+  minimize_vehicles: true
+  last_return_to_depot: true
+  distance_Lp_norm: 2
+  vehicle_penalty: 50
+  unused_capacity_penalty: 0.2
+  use_lagrangian_constraints: true
+  lagrangian_lr: 5e-5
+  lagrangian_ema: 0.05
+  lagrangian_max: 10.0
+  penalty_late_sum: 0.02
+  penalty_late_count: 0.1
+  penalty_masked_ratio: 0.02
+  penalty_pair_blocked: 0.0
+  penalty_depot_with_customer: 0.02
+  penalty_vehicle_over_lb: 0.08
+  target_late_sum: 0.0
+  target_late_count: 0.0
+  target_masked_ratio: 0.1
+  target_pair_blocked: 0.0
+  target_depot_with_customer: 0.05
+  target_vehicle_over_lb: 0.10
+  spare_numeric_capacity: 0
+  single_site_visit: true
+  strict_action_mask_train: true
+  strict_action_mask_infer: true
+  # PIP masking: set to true for PDPTW to enforce pickup-delivery TW feasibility proactively.
+  # For VRPTW it applies a conservative mask (nodes causing other nodes to miss TW).
+  use_pip_masking: false
+
+representation:
+  input_repr: Graph
+  k_connectivity: 32
+  self_loops: true
+  normalize: true
+  normalize_pos_obs_like_reward: true
+  normalize_reward_by_problem_size: false
+  add_distance_to_head: true
+
+logger:
+  episode_stats_limit: 1000
+  logging_level: 30
+
+model:
+  model_type: attention
+  head_model_type: attention
+  embedding_dim: 128
+  use_pair_norm: true
+  use_batch_norm: false
+  num_intermediate_features: 128
+  use_bias: true
+  agg_type: sum
+  edge_model_layers: 2
+  value_from_depot: false
+  reset_layers_freq: 0
+  reset_last_layers: false
+  reset_last_k_modules: 0
+  single_network: false
+  attention: true
+  split_actor_and_state_models: false
+  lazy: true
+  eight_rounding: false
+
+attention_model:
+  layer_normalization: "layer"
+  n_attention_layers_actor: 3
+  n_attention_layers_critic: 3
+  n_attention_layers_head_module: 2
+  n_attention_heads: 8
+  reweight_by_distance: false
+  reweight_function: exponential
+  use_basic_head_encoding: true
+  separate_head_and_action_model: false
+  num_head_encoder_layers: 2
+
+sampler:
+  score_to_prob: probs
+  temperature: 0.3
+  diversity_penalty: 0.0
+  normalize_attention: true
+  tanh_clipping: 10
+  complement_k_beams_calc: false
+  use_full_action_space_calc: true
+  autoregressive: true
+
+muzero:
+  expansion_method: "KPPO"
+  deterministic_branch_in_k_beams: true
+  zeroize_deterministic_log_prob: false
+  loss_type: "ppo"
+  max_leaves: 5
+  data_steps_per_epoch: 16    # base problems per epoch (augmented ×8 internally)
+  hash_states: true
+  max_moves: 5000
+
+speedups:
+  use_ray: false
+  use_fabric: false
+  n_workers: 1
+  amp: false
+  fused_optimizer: false
+  compile_mode: null
+  foreach_optimizer: false
+  share_data: true
+
+cuopt:
+  use_cuopt: false
+  climbers: 2048
+
+buffer:
+  max_buffer_size: 300000
+  allow_overflow: true
+  on_policy_buffer: true
+  buffer_precision: float32
+  randomize_minibatches: false

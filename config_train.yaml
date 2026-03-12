@@ -79,6 +79,11 @@ problem_setup:
   target_vehicle_over_lb: 0.0
   spare_numeric_capacity: 0.1
   single_site_visit: True
+  # PIP (Proactive Infeasibility Prevention) masking:
+  # When true, proactively block actions that would make future nodes permanently
+  # infeasible (VRPTW: masks nodes causing others to miss TW; PDPTW: masks pickup p
+  # if delivery d_p becomes unreachable after visiting p).
+  use_pip_masking: false
 
 representation:
   input_repr: Graph
