@@ -62,12 +62,18 @@ problem_setup:
   penalty_late_count: 0.1
   penalty_masked_ratio: 0.02
   penalty_pair_blocked: 0.0
+  penalty_depot_with_customer: 0.02
+  penalty_vehicle_over_lb: 0.08
   target_late_sum: 0.0
   target_late_count: 0.0
   target_masked_ratio: 0.1
   target_pair_blocked: 0.0
+  target_depot_with_customer: 0.05
+  target_vehicle_over_lb: 0.10
   spare_numeric_capacity: 0
   single_site_visit: true
+  strict_action_mask_train: true
+  strict_action_mask_infer: true
 
 representation:
   input_repr: Graph

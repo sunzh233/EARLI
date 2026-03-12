@@ -15,7 +15,7 @@ train:
   method: "tree_based"
   optimizer: "adam"
   seed: 0
-  deterministic_algo: true
+  deterministic_algo: false
   gamma: 1
   multi_gpu: false
   block_decreasing_action: false
@@ -50,6 +50,8 @@ problem_setup:
   unused_capacity_penalty: 0.2
   spare_numeric_capacity: 0
   single_site_visit: true
+  strict_action_mask_train: true
+  strict_action_mask_infer: true
 
 representation:
   input_repr: Graph

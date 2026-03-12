@@ -32,6 +32,9 @@ Two training methods are supported, controlled by ``train.method`` in the config
 
 import argparse
 import os
+import shutil
+from copy import deepcopy
+from datetime import datetime
 
 import torch
 import math
@@ -45,6 +48,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env import VecMonitor
+from torch.utils.tensorboard import SummaryWriter
 from yaml import SafeLoader
 
 from .models.attention_model import PosAttentionModel
@@ -262,11 +266,22 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
     print(f"[tree_based] Training {env_name} for {total_epochs} epochs "
           f"({data_steps} problems/epoch, {n_parallel} parallel) …")
 
+    tb_dir = config.get('system', {}).get('tensorboard_logdir', 'outputs/tensorboard')
+    default_tb_name = f"earli_tree_{os.path.splitext(os.path.basename(config['train']['save_model_path']))[0]}"
+    tb_name = config.get('system', {}).get('run_name') or default_tb_name
+    tb_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tb_run_dir = os.path.join(tb_dir, f"{tb_name}_{tb_stamp}")
+    os.makedirs(tb_run_dir, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=tb_run_dir)
+    print(f"[tree_based] TensorBoard run dir: {tb_run_dir}")
+
     logger = logging.getLogger(__name__)
     logger.info(
         f"[tree_based] Training {env_name} for {total_epochs} epochs "
         f"({data_steps} problems/epoch, {n_parallel} parallel) …"
     )
+
+    global_resample_step = 0
 
     for epoch in range(total_epochs):
         # ---- data collection via tree search ----
@@ -288,12 +303,19 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
         iter_best_returns = []
         iter_forward_passes = []
         iter_env_steps = []
-        for _ in range(n_iterations):
-            print(f"[tree_based] Epoch {epoch + 1}/{total_epochs}, iteration {_ + 1}/{n_iterations} …")
+        for iter_idx in range(n_iterations):
+            print(f"[tree_based] Epoch {epoch + 1}/{total_epochs}, iteration {iter_idx + 1}/{n_iterations} …")
             _, infos = collector.play_game(deterministic=False, training=True)
             td = infos.get('training_data')
             if td is not None and len(td) > 0:
                 all_training_data.append(td)
+
+            iter_samples = None
+            if td is not None:
+                try:
+                    iter_samples = int(len(td))
+                except Exception:
+                    iter_samples = None
 
             # collect diagnostics if available
             try:
@@ -340,6 +362,48 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
             except Exception:
                 pass
 
+            # Per-resample TensorBoard logging (one point per collector.play_game call)
+            try:
+                def _safe_mean(value):
+                    if value is None:
+                        return None
+                    if isinstance(value, torch.Tensor):
+                        return float(value.detach().float().mean().cpu().item())
+                    if isinstance(value, (list, tuple)):
+                        if len(value) == 0:
+                            return None
+                        return float(np.mean(value))
+                    if isinstance(value, np.ndarray):
+                        if value.size == 0:
+                            return None
+                        return float(value.mean())
+                    return float(value)
+
+                iter_best_return = _safe_mean(infos.get('best_return'))
+                iter_forward_iters = _safe_mean(infos.get('forward_iters'))
+                iter_data_samples = _safe_mean(infos.get('data_samples'))
+                iter_game_clocktime = _safe_mean(infos.get('game_clocktime'))
+                iter_num_vehicles = _safe_mean(infos.get('num_vehicles'))
+
+                if iter_best_return is not None:
+                    tb_writer.add_scalar('tree_based/iter/mean_best_return', iter_best_return, global_resample_step)
+                if iter_forward_iters is not None:
+                    tb_writer.add_scalar('tree_based/iter/mean_forward_iters', iter_forward_iters, global_resample_step)
+                if iter_data_samples is not None:
+                    tb_writer.add_scalar('tree_based/iter/mean_data_samples', iter_data_samples, global_resample_step)
+                if iter_game_clocktime is not None:
+                    tb_writer.add_scalar('tree_based/iter/mean_game_clocktime', iter_game_clocktime, global_resample_step)
+                if iter_num_vehicles is not None:
+                    tb_writer.add_scalar('tree_based/iter/mean_num_vehicles', iter_num_vehicles, global_resample_step)
+                if iter_samples is not None:
+                    tb_writer.add_scalar('tree_based/iter/training_samples_collected', float(iter_samples), global_resample_step)
+                tb_writer.add_scalar('tree_based/iter/epoch', float(epoch + 1), global_resample_step)
+                tb_writer.add_scalar('tree_based/iter/iteration_in_epoch', float(iter_idx + 1), global_resample_step)
+            except Exception:
+                pass
+
+            global_resample_step += 1
+
         if not all_training_data:
             logger.warning(f"[tree_based] Epoch {epoch}: no training data collected, skipping update.")
             continue
@@ -366,11 +430,31 @@ def _train_tree_based(config, env_class, datafile, total_epochs):
 
         logger.info(msg)
 
+        # Epoch summary TensorBoard logging
+        try:
+            tb_writer.add_scalar('tree_based/epoch/training_samples_total', float(len(training_data)), epoch + 1)
+            if mean_best_return is not None:
+                tb_writer.add_scalar('tree_based/epoch/mean_best_return', float(mean_best_return), epoch + 1)
+            if mean_forward_passes is not None:
+                tb_writer.add_scalar('tree_based/epoch/mean_forward_passes', float(mean_forward_passes), epoch + 1)
+            if mean_env_steps is not None:
+                tb_writer.add_scalar('tree_based/epoch/mean_env_steps', float(mean_env_steps), epoch + 1)
+            if hasattr(model, 'optimizer') and model.optimizer is not None:
+                lr = float(model.optimizer.param_groups[0]['lr'])
+                tb_writer.add_scalar('tree_based/epoch/learning_rate', lr, epoch + 1)
+            tb_writer.flush()
+        except Exception:
+            pass
+
     # ---- save ----
     save_path = config['train']['save_model_path']
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     torch.save({'model_state_dict': model.state_dict()}, save_path)
     print(f"[tree_based] Model saved to {save_path}")
+    try:
+        tb_writer.close()
+    except Exception:
+        pass
     return model
 
 
@@ -424,25 +508,56 @@ def _train_ppo(config, env_class, datafile, total_steps):
     # Optional periodic validation on eval.val_data_file.
     val_datafile = config['eval'].get('val_data_file')
     eval_callback = None
+    best_policy_path = None
     if val_datafile:
         if not os.path.exists(val_datafile):
             raise FileNotFoundError(
                 f"Validation dataset file not found: {val_datafile}"
             )
-        # Use eval mode so validation remains stable and does not inherit
-        # training-time random sampling behavior.
+        # Validation uses a dedicated config so we can random-sample validation
+        # problems without affecting inference/test configs.
+        eval_config = deepcopy(config)
+        eval_config.setdefault('eval', {})['sampling_mode'] = (
+            config.get('eval', {}).get('sampling_mode', 'random_with_replacement')
+        )
         n_eval_episodes = int(config['eval'].get('n_eval_episodes', 50))
         n_eval_episodes = max(1, n_eval_episodes)
-        eval_env = env_class(config, datafile=val_datafile, env_type='eval')
+        eval_env = env_class(eval_config, datafile=val_datafile, env_type='eval')
         if isinstance(eval_env, VecEnv):
             eval_env = VecMonitor(eval_env)
         else:
             eval_env = Monitor(eval_env)
+
+        class SaveBestPolicyStateDictCallback(BaseCallback):
+            def __init__(self, save_path: str, verbose=0):
+                super().__init__(verbose)
+                self.save_path = save_path
+
+            def _on_step(self) -> bool:
+                self._save_best()
+                return True
+
+            def _on_training_start(self) -> None:
+                os.makedirs(os.path.dirname(os.path.abspath(self.save_path)), exist_ok=True)
+
+            def _on_rollout_end(self) -> None:
+                return None
+
+            def _save_best(self) -> None:
+                torch.save({'model_state_dict': self.model.policy.state_dict()}, self.save_path)
+                if self.verbose:
+                    print(f"[ppo] Saved new best validation checkpoint to {self.save_path}")
+
+        save_path = config['train']['save_model_path']
+        best_policy_path = f"{save_path}.best"
+        best_callback = SaveBestPolicyStateDictCallback(best_policy_path, verbose=1)
         eval_callback = EvalCallback(
             eval_env,
             eval_freq=max(1, n_steps),
             n_eval_episodes=n_eval_episodes,
             deterministic=bool(config['eval'].get('deterministic_test_beam', True)),
+            best_model_save_path=None,
+            callback_on_new_best=best_callback,
             verbose=1,
         )
 
@@ -534,15 +649,45 @@ def _train_ppo(config, env_class, datafile, total_steps):
         print(
             f"[ppo] Validation enabled: val_data_file={val_datafile}, "
             f"eval_freq={max(1, n_steps)} (matches rollout collection frequency), "
-            f"n_eval_episodes={n_eval_episodes}"
+            f"n_eval_episodes={n_eval_episodes}, "
+            f"sampling_mode={config.get('eval', {}).get('sampling_mode', 'random_with_replacement')}"
         )
     # Create a callback that records per-rollout scalars to TensorBoard.
     class PerRolloutTensorboardCallback(BaseCallback):
         def __init__(self, verbose=0):
             super().__init__(verbose)
+            self._constraint_sums = {}
+            self._constraint_counts = {}
 
         def _on_step(self) -> bool:
-            # Required abstract implementation; do nothing per step.
+            infos = self.locals.get('infos', None)
+            if infos:
+                tracked = [
+                    'hard_constraint_override_ratio',
+                    'late_sum',
+                    'late_count',
+                    'masked_ratio',
+                    'depot_with_customer',
+                    'vehicle_over_lb',
+                    'constraint_penalty',
+                ]
+                for info in infos:
+                    if not isinstance(info, dict):
+                        continue
+                    for key in tracked:
+                        if key not in info:
+                            continue
+                        val = info[key]
+                        try:
+                            if hasattr(val, 'detach'):
+                                import torch as _torch
+                                v = float(_torch.as_tensor(val).float().mean().item())
+                            else:
+                                v = float(val)
+                        except Exception:
+                            continue
+                        self._constraint_sums[key] = self._constraint_sums.get(key, 0.0) + v
+                        self._constraint_counts[key] = self._constraint_counts.get(key, 0) + 1
             return True
 
         def _on_rollout_end(self) -> None:
@@ -569,6 +714,13 @@ def _train_ppo(config, env_class, datafile, total_steps):
                     # map slashes to underscores under custom/ namespace
                     safe_tag = tag.replace('/', '_')
                     self.logger.record(f'custom/{safe_tag}', float(val))
+
+            for key, total in self._constraint_sums.items():
+                cnt = self._constraint_counts.get(key, 0)
+                if cnt > 0:
+                    self.logger.record(f'custom/constraint_{key}', float(total / cnt))
+            self._constraint_sums.clear()
+            self._constraint_counts.clear()
 
             # Additionally, if the model has an episode info buffer, compute
             # and log mean episode reward/length from it (more reliable).
@@ -598,8 +750,16 @@ def _train_ppo(config, env_class, datafile, total_steps):
 
     save_path = config['train']['save_model_path']
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    torch.save({'model_state_dict': sb3_model.policy.state_dict()}, save_path)
-    print(f"[ppo] Model saved to {save_path}")
+    last_policy_path = f"{save_path}.last"
+    torch.save({'model_state_dict': sb3_model.policy.state_dict()}, last_policy_path)
+    print(f"[ppo] Saved last-step checkpoint to {last_policy_path}")
+
+    if best_policy_path is not None and os.path.exists(best_policy_path):
+        shutil.copy2(best_policy_path, save_path)
+        print(f"[ppo] Validation-best checkpoint promoted to {save_path}")
+    else:
+        shutil.copy2(last_policy_path, save_path)
+        print(f"[ppo] No validation-best checkpoint found. Using last-step checkpoint at {save_path}")
     return sb3_model
 
 

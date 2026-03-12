@@ -155,6 +155,15 @@ def load_external_solutions(logs_fpaths, problems, K=None, to_sort=True, force_o
                             post_ls_solutions=True, get_to_choose=False, LP=2):
     # load results
     solutions = [load_solutions_from_path(fpath, post_ls_solutions) for fpath in logs_fpaths]  # solutions[source][problem][sol][node]
+    expected_n = int(len(problems['demand']))
+    loaded_ns = [int(len(src_solutions)) for src_solutions in solutions]
+    if any(n != expected_n for n in loaded_ns):
+        raise ValueError(
+            'External solutions count mismatch: '
+            f'expected {expected_n} problems from current dataset, '
+            f'got per-source counts {loaded_ns} from logs {logs_fpaths}. '
+            'Please regenerate test_logs with the same sampled subset.'
+        )
     solutions = [list(src_sols) for src_sols in zip(*solutions)]  # solutions[problem][source][sol][node]
 
     # take top k
@@ -170,9 +179,53 @@ def load_external_solutions(logs_fpaths, problems, K=None, to_sort=True, force_o
     else:
         solutions = [[sol for src_sols in prob_sols for sol in src_sols] for prob_sols in solutions]  # solutions[problem][sol][node]
 
+    raw_counts = [len(problem_solutions) for problem_solutions in solutions]
+
     # remove invalid solutions
-    solutions = [[sol for sol in problem_solutions if eval_utils.verify_solution(sol, prob_demands)]
-                 for problem_solutions, prob_demands, prob_cap in zip(solutions, problems['demand'], problems['capacity'])]
+    # NOTE: for VRPTW/PDPTW we must check both capacity and time windows,
+    # otherwise infeasible routes can still slip into injection.
+    has_tw = ('time_windows' in problems) and ('service_times' in problems)
+    solutions = [
+        [
+            sol for sol in problem_solutions
+            if eval_utils.verify_solution(
+                sol,
+                prob_demands,
+                prob_cap,
+                distance_matrix=prob_dist if has_tw else None,
+                time_windows=prob_tw if has_tw else None,
+                service_times=prob_svc if has_tw else None,
+            )
+        ]
+        for problem_solutions, prob_demands, prob_cap, prob_dist, prob_tw, prob_svc in zip(
+            solutions,
+            problems['demand'],
+            problems['capacity'],
+            problems['distance_matrix'],
+            problems.get('time_windows', [None] * len(solutions)),
+            problems.get('service_times', [None] * len(solutions)),
+        )
+    ]
+
+    valid_counts = [len(problem_solutions) for problem_solutions in solutions]
+    raw_zero_ids = [i for i, n in enumerate(raw_counts) if n == 0]
+    filtered_to_zero_ids = [
+        i for i, (n_raw, n_valid) in enumerate(zip(raw_counts, valid_counts))
+        if n_raw > 0 and n_valid == 0
+    ]
+    print(f"[inject-load] problems = {len(solutions)}; valid solutions per problem: mean={np.mean(valid_counts):.1f}, ")
+    if raw_zero_ids or filtered_to_zero_ids:
+        print(
+            f"[inject-load] problems={len(solutions)} raw_empty={len(raw_zero_ids)} "
+            f"filtered_to_empty={len(filtered_to_zero_ids)}"
+        )
+        if raw_zero_ids:
+            print(f"[inject-load] raw-empty problem_ids(sample): {raw_zero_ids[:10]}")
+        if filtered_to_zero_ids:
+            print(
+                f"[inject-load] filtered-to-empty problem_ids(sample): "
+                f"{filtered_to_zero_ids[:10]}"
+            )
 
     # sort solutions
     if to_sort or force_opt_cars:
@@ -213,9 +266,23 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
         else:
             # method_sols is expected to be a list indexed by problem
             external_solutions = method_sols[ind] if ind < len(method_sols) else []
+        if len(external_solutions) == 0:
+            total_probs = len(method_sols) if isinstance(method_sols, (list, tuple)) else 0
+            print(
+                f"[inject] method={method} problem={ind}: no external solutions available "
+                f"(loaded_problems={total_probs})."
+            )
         if force_feasible:
+            has_tw = ('time_windows' in problems) and ('service_times' in problems)
             external_solutions = [sol for sol in external_solutions if eval_utils.verify_solution(
-                sol, problems['demand'][ind], problems['capacity'][ind].item(), n_carriers)]
+                sol,
+                problems['demand'][ind],
+                problems['capacity'][ind].item(),
+                n_carriers,
+                distance_matrix=problems['distance_matrix'][ind] if has_tw else None,
+                time_windows=problems['time_windows'][ind] if has_tw else None,
+                service_times=problems['service_times'][ind] if has_tw else None,
+            )]
         add_naive = False
         if BOTH_RL_AND_NAIVE == 2:  # add naive anyway
             add_naive = True
@@ -240,6 +307,21 @@ def preprocess_external_solutions(method, ind, problems, n_carriers, rlopt_solut
         if '_inj' in method:
             t_inj = 1.  # inject after cuopt's first solution generation, not instead
         external_solutions = [[t_inj, sol] for sol in external_solutions]
+
+    # cuOpt rejects injected solutions that use more vehicles than current fleet size.
+    # Filter them out up-front to avoid hard solver validation failures.
+    if 'cuOpt' in method and external_solutions:
+        ext_before = len(external_solutions)
+        external_solutions = [
+            sol for sol in external_solutions
+            if int(np.sum(np.array(sol[1][:-1]) == 0)) <= int(n_carriers)
+        ]
+        dropped = ext_before - len(external_solutions)
+        if dropped > 0:
+            print(
+                f"[inject] method={method} problem={ind}: dropped {dropped}/{ext_before} "
+                f"external solutions exceeding n_carriers={n_carriers}."
+            )
 
     sols_cars = [np.sum(np.array(sol[1][:-1]) == 0) for sol in external_solutions]
     best_cars = np.min(sols_cars) if len(sols_cars) > 0 else np.nan
@@ -690,9 +772,16 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
             svc = problems['service_times'][ind]
             dt = _as_numpy(svc).astype(float)
 
+        has_tw_constraints = (t_min is not None) and (t_max is not None)
+        # For VRPTW/PDPTW, keep travel-time units aligned with TW/service units.
+        # Normalizing only distance_matrix while leaving TW/service unscaled causes
+        # cuOpt feasibility checks to operate in a different time scale.
+        distance_for_solver = distance_np if has_tw_constraints else (distance_np / CUOPT_NORMALIZATION)
+        cost_scale = 1.0 if has_tw_constraints else CUOPT_NORMALIZATION
+
         problem = solver.create_data_model(
             demand=demand_arr,
-            distance_matrix=distance_np / CUOPT_NORMALIZATION,
+            distance_matrix=distance_for_solver,
             vehicle_capacity=np.full(shape=(n_carriers,),
                                      fill_value=int(capacity),
                                      dtype=int),
@@ -716,7 +805,7 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
             return False, np.nan, np.nan, [], pd.Series(dtype='float'), actual_runtime, np.nan, None, None
         success = routing_solution.get_status() == 0
         vehicle_count = routing_solution.get_vehicle_count()
-        cost = CUOPT_NORMALIZATION * routing_solution.get_total_objective()
+        cost = cost_scale * routing_solution.get_total_objective()
         solution = convert_cuopt_solution(routing_solution)
         accepted = routing_solution.get_accepted_solutions()
         # DEBUG: inspect accepted object to catch non-cudf types causing downstream failures
@@ -739,29 +828,22 @@ def run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind,
         except Exception as _e:
             print("DEBUG: inspecting accepted failed:", _e)
 
-        # Produce both a pandas.Series for existing logic and a cudf Column for APIs that require Column
+        # Normalize accepted flags to pandas.Series for downstream stats logic.
+        # Avoid exposing cudf internals here since some cuDF versions can raise
+        # "All data.values() must be Column, not Series" in mixed conversion paths.
         accepted_pandas = None
         accepted_column = None
         try:
             if isinstance(accepted, cudf.Series):
                 accepted_pandas = accepted.to_pandas()
-                accepted_column = accepted._column
             elif isinstance(accepted, pd.Series):
                 accepted_pandas = accepted
-                try:
-                    accepted_column = cudf.Series(accepted_pandas)._column
-                except Exception:
-                    accepted_column = None
             else:
                 # fallback: try to convert iterable to pandas then cudf
                 try:
                     accepted_pandas = pd.Series(list(accepted)) if accepted is not None else pd.Series(dtype='float')
                 except Exception:
                     accepted_pandas = pd.Series(dtype='float')
-                try:
-                    accepted_column = cudf.Series(accepted_pandas)._column
-                except Exception:
-                    accepted_column = None
             # ensure pandas series type for downstream code
             try:
                 if not isinstance(accepted_pandas, pd.Series):
@@ -853,8 +935,7 @@ def main(config_path='config_initialization.yaml'):
     LAST_RETURN_TO_DEPOT = config['problem']['last_return_to_depot']
     FIXED_VEHICLES = config['cuopt']['fixed_vehicles']
     SPARE_VEHICLES = config['cuopt']['spare_vehicles']
-    if SPARE_VEHICLES > 0:
-        FIXED_VEHICLES = False
+    SPARE_VEHICLES = int(SPARE_VEHICLES)
     USE_REF_VEHICLES = config['cuopt']['use_reference_for_num_vehicles']
     PULL_FREQ = config['cuopt']['pull_freq']
 
@@ -928,10 +1009,20 @@ def main(config_path='config_initialization.yaml'):
                 tot_demand = np.sum(_as_numpy(demands_for_solver))
                 max_capacity = problems['capacity'][ind]
                 if USE_REF_VEHICLES:
-                    n_carriers = problems['baseline_vehicles'][ind].item() + SPARE_VEHICLES
+                    n_carriers = int(problems['baseline_vehicles'][ind].item()) + (0 if FIXED_VEHICLES else SPARE_VEHICLES)
                 else:
+                    lb_carriers = int(np.ceil(tot_demand / max_capacity))
                     n_carriers = get_num_carriers_candidates(
                         tot_demand, max_capacity, margin=0 if FIXED_VEHICLES else SPARE_VEHICLES)
+
+                    # Guard rail: very large spare_vehicles can explode fleet size
+                    # (e.g. lb + 1000), which hurts objective quality and masks policy quality.
+                    if ENV in ('vrptw', 'pdptw'):
+                        n_nodes = int(problems['distance_matrix'][ind].shape[0])
+                        max_customers = max(1, n_nodes - 1)
+                        # Allow moderate slack above lower bound, but avoid pathological fleet explosion.
+                        soft_cap = min(max_customers, lb_carriers + 32)
+                        n_carriers = int(min(n_carriers, max(lb_carriers, soft_cap)))
 
                 avoid_suboptimal_cars = AVOID_SUBOPTIMAL_CARS
                 print(f"\nRunning {method} on problem {ind} with time budget {solver_time:.1f}s (init {init_runtime:.1f}s, GA {ga_time:.1f}s), ")
@@ -983,9 +1074,19 @@ def main(config_path='config_initialization.yaml'):
                             run_cuopt(external_solutions, problems, demands_for_solver, n_carriers, ind, ga_time, ENV, LAST_RETURN_TO_DEPOT, FIXED_VEHICLES, PULL_FREQ, CUOPT_NORMALIZATION)
 
                     # re-verify solution
+                    has_tw = ('time_windows' in problems) and ('service_times' in problems)
                     if success:
                         success2 = eval_utils.verify_solution(
-                            solution, _as_numpy(demands_for_solver), max_capacity.item(), n_carriers, True, print)
+                            solution,
+                            _as_numpy(demands_for_solver),
+                            max_capacity.item(),
+                            n_carriers,
+                            True,
+                            print,
+                            distance_matrix=problems['distance_matrix'][ind] if has_tw else None,
+                            time_windows=problems['time_windows'][ind] if has_tw else None,
+                            service_times=problems['service_times'][ind] if has_tw else None,
+                        )
                         # print(f"Verified solution for problem {ind} with method {method}: success={success2}")
                         if not success2:
                             print(f'Solution validation failed ({solver_time}, {ind}, {method}).')
@@ -993,11 +1094,99 @@ def main(config_path='config_initialization.yaml'):
                         # if first indicator is failure - don't trust verifier to work properly, and default to False.
                         try:
                             success2 = eval_utils.verify_solution(
-                                solution, _as_numpy(demands_for_solver), max_capacity.item(), n_carriers, False)
+                                solution,
+                                _as_numpy(demands_for_solver),
+                                max_capacity.item(),
+                                n_carriers,
+                                False,
+                                distance_matrix=problems['distance_matrix'][ind] if has_tw else None,
+                                time_windows=problems['time_windows'][ind] if has_tw else None,
+                                service_times=problems['service_times'][ind] if has_tw else None,
+                            )
                         except:
                             success2 = False
 
+                    # For VRPTW/PDPTW, demand/capacity-based carrier lower-bound can be too tight.
+                    # If verification fails, retry once with a relaxed vehicle budget
+                    # (up to one customer per vehicle) to avoid falsely concluding no feasible solution.
+                    if (
+                        not success2
+                        and ENV in ('vrptw', 'pdptw')
+                        and (not FIXED_VEHICLES)
+                    ):
+                        try:
+                            max_carriers = int(problems['distance_matrix'][ind].shape[0] - 1)
+                            # Incremental relaxation instead of jumping straight to max_carriers.
+                            relaxed_carriers = min(max_carriers, n_carriers + max(1, n_carriers // 4))
+                        except Exception:
+                            relaxed_carriers = n_carriers
+
+                        if relaxed_carriers > n_carriers:
+                            print(
+                                f"[fallback] problem={ind} method={method}: "
+                                f"retry with relaxed n_carriers={relaxed_carriers} (was {n_carriers})"
+                            )
+                            success_r, veh_r, cost_r, sol_r, acc_r, rt_r, it_r, pop_r, acc_col_r = run_cuopt(
+                                external_solutions,
+                                problems,
+                                demands_for_solver,
+                                relaxed_carriers,
+                                ind,
+                                ga_time,
+                                ENV,
+                                LAST_RETURN_TO_DEPOT,
+                                FIXED_VEHICLES,
+                                PULL_FREQ,
+                                CUOPT_NORMALIZATION,
+                            )
+
+                            if success_r:
+                                success2_r = eval_utils.verify_solution(
+                                    sol_r,
+                                    _as_numpy(demands_for_solver),
+                                    max_capacity.item(),
+                                    relaxed_carriers,
+                                    False,
+                                    distance_matrix=problems['distance_matrix'][ind] if has_tw else None,
+                                    time_windows=problems['time_windows'][ind] if has_tw else None,
+                                    service_times=problems['service_times'][ind] if has_tw else None,
+                                )
+                            else:
+                                success2_r = False
+
+                            if success2_r:
+                                success, vehicle_count, cost, solution = success_r, veh_r, cost_r, sol_r
+                                accepted, actual_runtime, num_iterations = acc_r, rt_r, it_r
+                                populations, accepted_column = pop_r, acc_col_r
+                                n_carriers = relaxed_carriers
+                                success2 = True
+                                print(
+                                    f"[fallback] recovered feasible solution for problem={ind}, "
+                                    f"method={method}, vehicles={vehicle_count}, cost={cost:.3f}"
+                                )
+
                     # update results
+                    try:
+                        if accepted is None:
+                            accepted = pd.Series(dtype='int32')
+                        elif isinstance(accepted, cudf.Series):
+                            accepted = accepted.to_pandas()
+                        elif isinstance(accepted, cudf.DataFrame):
+                            accepted = accepted.to_pandas().iloc[:, 0] if accepted.shape[1] > 0 else pd.Series(dtype='int32')
+                        elif isinstance(accepted, pd.DataFrame):
+                            accepted = accepted.iloc[:, 0] if accepted.shape[1] > 0 else pd.Series(dtype='int32')
+                        elif not isinstance(accepted, pd.Series):
+                            accepted = pd.Series(list(accepted))
+                    except Exception:
+                        accepted = pd.Series(dtype='int32')
+
+                    try:
+                        accepted = pd.to_numeric(accepted, errors='coerce').fillna(-1).astype('int32')
+                    except Exception:
+                        accepted = pd.Series(dtype='int32')
+
+                    accepted_np = accepted.to_numpy(copy=False)
+
                     problem_id = ind if REPETITIONS == 1 else str(ind)+chr(97+repetition)
                     methods.append(method)
                     solver_times.append(solver_time)
@@ -1008,10 +1197,10 @@ def main(config_path='config_initialization.yaml'):
                     successes2.append(success2)
                     vehicles.append(vehicle_count)
                     costs.append(cost)
-                    n_external.append(len(accepted))
-                    n_accepted.append((accepted == 1).astype(int).sum())
-                    n_rejected.append((accepted == 0).astype(int).sum())
-                    n_unconsidered.append((accepted == -1).astype(int).sum())
+                    n_external.append(int(accepted_np.size))
+                    n_accepted.append(int((accepted_np == 1).sum()))
+                    n_rejected.append(int((accepted_np == 0).sum()))
+                    n_unconsidered.append(int((accepted_np == -1).sum()))
                     extra_naive_injection.append(extra_time_needed > 0)
                     solver_iterations.append(num_iterations)
                     update_accepted_stats(external_solutions, problems['distance_matrix'][ind], accepted,

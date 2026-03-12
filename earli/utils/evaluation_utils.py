@@ -8,6 +8,20 @@ import pandas as pd
 import torch
 
 
+def _to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _to_float(x):
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().cpu().item())
+    if isinstance(x, np.ndarray):
+        return float(np.asarray(x).reshape(-1)[0])
+    return float(x)
+
+
 def maybe_update_best_result(best_result, candidate_result):
     if candidate_result is not None:
         if isinstance(best_result, dict):
@@ -208,11 +222,18 @@ def solutions_costs(sols, positions, **kwargs):
 
 
 def verify_solution(solution, demands, capacity=None, max_vehicles=None, verbose=False,
-                    verbose_fun=warnings.warn):
+                    verbose_fun=warnings.warn, distance_matrix=None,
+                    time_windows=None, service_times=None):
     solution = np.array(solution)
+    demands = _to_numpy(demands)
+    if capacity is not None:
+        capacity = _to_float(capacity)
+    if max_vehicles is not None:
+        max_vehicles = int(_to_float(max_vehicles))
     n = len(demands)
     if set(solution) != set(range(n)):
         if verbose:
+            print(f'Solution nodes: {set(solution)}, expected: {set(range(n))}')
             verbose_fun(f'Solution has missing nodes ({len(np.unique(solution))} instead of {n})')
         return False
     depot_indices = np.where(solution == 0)[0]
@@ -221,13 +242,41 @@ def verify_solution(solution, demands, capacity=None, max_vehicles=None, verbose
         route_loads = np.array([np.sum(route) for route in route_demands])
         if np.any(route_loads > capacity):
             if verbose:
+                print(f'Route loads: {route_loads}, capacity: {capacity}')
                 verbose_fun(f'Solution has overloaded route ({max(route_loads)} > {capacity})')
             return False
     if max_vehicles is not None:
         if len(depot_indices) - 1 > max_vehicles:
             if verbose:
+                print(f'Number of vehicles: {len(depot_indices) - 1}, max allowed: {max_vehicles}')
                 verbose_fun(f'Solution has {len(depot_indices) - 1} > {max_vehicles} vehicles')
             return False
+
+    if distance_matrix is not None and time_windows is not None and service_times is not None:
+        tw = _to_numpy(time_windows)
+        svc = _to_numpy(service_times)
+        dist = _to_numpy(distance_matrix)
+        if tw.ndim < 2 or tw.shape[1] < 2:
+            if verbose:
+                print(f'Time windows shape: {tw.shape}, expected (n_nodes, >=2)')
+                verbose_fun('Invalid time_windows format, expected shape (n_nodes, >=2)')
+            return False
+
+        cur_time = 0.0
+        for src, dst in zip(solution[:-1], solution[1:]):
+            arrive = cur_time + float(svc[src]) + float(dist[src, dst])
+            if dst != 0:
+                due = float(tw[dst, 1])
+                if arrive > due + 1e-6:
+                    if verbose:
+                        print(f'Solution violates time window at node {dst} ({arrive:.4f} > {due:.4f})')
+                        verbose_fun(f'Solution violates time window at node {dst} ({arrive:.4f} > {due:.4f})')
+                    return False
+                ready = float(tw[dst, 0])
+                cur_time = max(arrive, ready)
+            else:
+                cur_time = 0.0
+
     return True
 
 

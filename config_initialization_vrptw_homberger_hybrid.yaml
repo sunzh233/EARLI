@@ -15,18 +15,18 @@ speedups:
   use_fabric: false
 
 names:
-  run_title: "injection_vrptw_homberger"
+  run_title: "injection_vrptw_homberger_hybrid"
   methods: ["cuOpt", "cuOpt_RL"]
   baseline: cuOpt
   main_method: cuOpt_RL
   verbose: 2
 
 paths:
-  problems: datasets/homberger_vrptw_curriculum/vrptw_test_1000.pkl
-  solutions: outputs/test_logs.pkl
+  problems: datasets/vrptw_homberger_like_curriculum/vrptw_test_homberger_1000.pkl
+  solutions: outputs/hybrid/test_logs_homberger_1000.pkl
   solutions_source: null
   naive_source: null
-  out_summary: test_summary_vrptw_homberger
+  out_summary: test_summary_vrptw_homberger_hybrid
 
 problem:
   env: vrptw
@@ -44,7 +44,7 @@ cuopt:
   repetitions: 1
 
 injection:
-  max_injections: 16
+  max_injections: 24
   can_choose_injections: false
   post_ls_solutions: 1
   both_rl_and_naive: 0

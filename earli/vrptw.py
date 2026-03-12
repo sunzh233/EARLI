@@ -61,6 +61,12 @@ class VRPTW(VRP):
     def _init_constraint_penalty_state(self):
         ps = self.config.get('problem_setup', {})
 
+        # Keep action selection inside the feasible mask for both train and inference.
+        # If an invalid action still arrives from upstream, we project it back to a
+        # feasible action; if no feasible action exists, we deactivate that env step.
+        self.strict_action_mask_train = bool(ps.get('strict_action_mask_train', True))
+        self.strict_action_mask_infer = bool(ps.get('strict_action_mask_infer', True))
+
         self.use_lagrangian_constraints = bool(ps.get('use_lagrangian_constraints', False))
         self.lagrangian_lr = float(ps.get('lagrangian_lr', 1e-4))
         self.lagrangian_ema = float(ps.get('lagrangian_ema', 0.05))
@@ -71,6 +77,8 @@ class VRPTW(VRP):
             'late_count': float(ps.get('penalty_late_count', 0.0)),
             'masked_ratio': float(ps.get('penalty_masked_ratio', 0.0)),
             'pair_blocked': float(ps.get('penalty_pair_blocked', 0.0)),
+            'depot_with_customer': float(ps.get('penalty_depot_with_customer', 0.0)),
+            'vehicle_over_lb': float(ps.get('penalty_vehicle_over_lb', 0.0)),
         }
 
         self.constraint_targets = {
@@ -78,6 +86,8 @@ class VRPTW(VRP):
             'late_count': float(ps.get('target_late_count', 0.0)),
             'masked_ratio': float(ps.get('target_masked_ratio', 0.0)),
             'pair_blocked': float(ps.get('target_pair_blocked', 0.0)),
+            'depot_with_customer': float(ps.get('target_depot_with_customer', 0.0)),
+            'vehicle_over_lb': float(ps.get('target_vehicle_over_lb', 0.0)),
         }
 
         self.lagrangian_state = {
@@ -119,6 +129,11 @@ class VRPTW(VRP):
         # current time for each vehicle (dynamic state)
         self.current_time = torch.zeros(
             self.maybe_extend([self.n_parallel_problems, 1]), device=self.device)
+        # Number of vehicle departures from depot in current episode.
+        self.vehicle_starts = torch.zeros(
+            self.maybe_extend([self.n_parallel_problems, 1]), device=self.device)
+        # Demand lower-bound on vehicle count, computed at reset.
+        self.vehicle_lb = torch.ones([self.n_parallel_problems], device=self.device)
 
         # Extend observation space with time-window features
         if not self.stable_baselines_compatibility:
@@ -150,6 +165,7 @@ class VRPTW(VRP):
         self.terminal_state = {
             **self.terminal_state,
             'current_time': torch.zeros([1, 1], device=self.device),
+            'vehicle_starts': torch.zeros([1, 1], device=self.device),
         }
         if self.config['system']['use_tensordict']:
             self.terminal_state = TensorDict(self.terminal_state, batch_size=1)
@@ -171,6 +187,11 @@ class VRPTW(VRP):
         tw = self.reference['time_windows'][fixed_dataset_indices].clone()   # (n, n_nodes, 2)
         svc = self.reference['service_times'][fixed_dataset_indices].clone()  # (n, n_nodes)
 
+        # Keep travel time and TW/service on the same scale when distance is normalized.
+        if self.normalize:
+            tw = tw * self.reward_normalization
+            svc = svc * self.reward_normalization
+
         self.ref_time_windows[indices] = tw.float()
         self.ref_service_times[indices] = svc.float()
         return n
@@ -182,6 +203,11 @@ class VRPTW(VRP):
     def reset_dynamic_properties(self, indices, n_envs_to_reset):
         super().reset_dynamic_properties(indices, n_envs_to_reset)
         self.current_time[indices] = 0.0
+        self.vehicle_starts[indices] = 0.0
+
+        total_demand = self.initial_demand[indices].sum(dim=-1)
+        cap = self.max_capacity[indices].clamp(min=1e-8)
+        self.vehicle_lb[indices] = torch.ceil(total_demand / cap).clamp(min=1.0)
 
         # Apply initial time-window feasibility: block nodes that cannot be
         # reached from the depot before their due_date.
@@ -224,6 +250,7 @@ class VRPTW(VRP):
         capacity = self.capacity.view(-1)
         acc_returns = self.acc_returns.view(-1)
         current_time = self.current_time.view(-1)
+        vehicle_starts = self.vehicle_starts.view(-1)
 
         # Flat time-window / service-time views (replicated over beams if needed)
         if self.extended_output_format:
@@ -242,9 +269,38 @@ class VRPTW(VRP):
         active_env = actions >= 0
         actions[~active_env] = 0
         dummy_ind = torch.arange(n_actions, dtype=torch.long, device=target_device)
+
+        feasible_flat = self.feasible_nodes.view(-1, self.problem_size)
+        action_is_feasible = feasible_flat[dummy_ind, actions]
+        invalid_active = active_env & (~action_is_feasible)
+        if invalid_active.any():
+            strict_mask = self.strict_action_mask_train if self.env_type == 'train' else self.strict_action_mask_infer
+            feasible_rows = feasible_flat[invalid_active]
+            has_feasible = feasible_rows.any(dim=-1)
+
+            if has_feasible.any():
+                fallback = feasible_rows[has_feasible].float().argmax(dim=-1).to(actions.dtype)
+                invalid_idx = invalid_active.nonzero(as_tuple=False).squeeze(-1)
+                actions[invalid_idx[has_feasible]] = fallback
+
+            if (~has_feasible).any():
+                invalid_idx = invalid_active.nonzero(as_tuple=False).squeeze(-1)
+                no_feasible_idx = invalid_idx[~has_feasible]
+                if strict_mask:
+                    # No legal continuation: deactivate these envs for this step.
+                    actions[no_feasible_idx] = -1
+                else:
+                    actions[no_feasible_idx] = DEPOT_LOCATION
+
+            # Recompute activity after correction/deactivation.
+            active_env = actions >= 0
+            actions[~active_env] = 0
+
         from_depot = active_env & (head[:n_actions] == DEPOT_LOCATION)
         depot_visit = active_env & (actions == DEPOT_LOCATION)
         visit_site = actions.clone()
+        new_vehicle_start = from_depot & (visit_site != DEPOT_LOCATION)
+        vehicle_starts[new_vehicle_start] += 1.0
 
         # Travel distance reward
         reward = -distance_matrix[dummy_ind, head, visit_site]
@@ -306,10 +362,20 @@ class VRPTW(VRP):
         masked_ratio = masked_by_tw.float().sum(dim=-1) / candidate_count
         masked_ratio = torch.where(active_env, masked_ratio, torch.zeros_like(masked_ratio))
 
+        feasible_non_depot = candidate_nodes & tw_feasible
+        has_feasible_non_depot = feasible_non_depot.any(dim=-1)
+        depot_with_customer = (depot_visit & has_feasible_non_depot).float()
+        depot_with_customer = torch.where(
+            active_env,
+            depot_with_customer,
+            torch.zeros_like(depot_with_customer),
+        )
+
         constraint_penalty = (
             self._constraint_weight('late_sum') * lateness
             + self._constraint_weight('late_count') * late_count
             + self._constraint_weight('masked_ratio') * masked_ratio
+            + self._constraint_weight('depot_with_customer') * depot_with_customer
         )
 
         reward_flat = reward.view(-1)
@@ -321,15 +387,22 @@ class VRPTW(VRP):
             self._maybe_update_lagrangian('late_sum', lateness[active_mask])
             self._maybe_update_lagrangian('late_count', late_count[active_mask])
             self._maybe_update_lagrangian('masked_ratio', masked_ratio[active_mask])
+            self._maybe_update_lagrangian('depot_with_customer', depot_with_customer[active_mask])
 
         info.update({
             'late_sum': lateness,
             'late_count': late_count,
             'masked_ratio': masked_ratio,
+            'depot_with_customer': depot_with_customer,
+            'hard_constraint_override_ratio': invalid_active.float().mean(),
+            'hard_constraint_no_feasible_ratio': (
+                (invalid_active & (~feasible_flat[dummy_ind].any(dim=-1))).float().mean()
+            ),
             'constraint_penalty': constraint_penalty,
             'lagrangian_lambda_late_sum': self.lagrangian_state['late_sum']['lambda'],
             'lagrangian_lambda_late_count': self.lagrangian_state['late_count']['lambda'],
             'lagrangian_lambda_masked_ratio': self.lagrangian_state['masked_ratio']['lambda'],
+            'lagrangian_lambda_depot_with_customer': self.lagrangian_state['depot_with_customer']['lambda'],
         })
 
         self.feasible_nodes = (
@@ -342,6 +415,33 @@ class VRPTW(VRP):
         if self.last_go_back_to_depot:
             dones = dones & (head == DEPOT_LOCATION).view_as(dones)
         dones = dones | ~active_env.view_as(dones)
+
+        done_active = dones.view(-1) & active_env
+        vehicle_over_lb = torch.zeros_like(reward_flat)
+        vehicle_over_lb_penalty = torch.zeros_like(reward_flat)
+        if done_active.any():
+            if self.extended_output_format:
+                vehicle_lb = self.vehicle_lb.unsqueeze(1).expand(
+                    self.n_parallel_problems, self.n_beams
+                ).reshape(-1)
+            else:
+                vehicle_lb = self.vehicle_lb
+            vehicle_over_lb[done_active] = torch.clamp(
+                vehicle_starts[done_active] - vehicle_lb[done_active],
+                min=0.0,
+            )
+            vehicle_over_lb_penalty = self._constraint_weight('vehicle_over_lb') * vehicle_over_lb
+            reward_flat[done_active] -= vehicle_over_lb_penalty[done_active]
+            acc_returns[done_active] -= vehicle_over_lb_penalty[done_active]
+            self._maybe_update_lagrangian('vehicle_over_lb', vehicle_over_lb[done_active])
+
+        reward = reward_flat.view(*self.batch_dim)
+
+        info.update({
+            'vehicle_over_lb': vehicle_over_lb,
+            'vehicle_over_lb_penalty': vehicle_over_lb_penalty,
+            'lagrangian_lambda_vehicle_over_lb': self.lagrangian_state['vehicle_over_lb']['lambda'],
+        })
 
         obs = None
         if calc_obs:

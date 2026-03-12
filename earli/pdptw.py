@@ -219,6 +219,14 @@ class PDPTW(VRPTW):
         active_env = actions >= 0
         actions[~active_env] = 0
         dummy_ind = torch.arange(n_actions, dtype=torch.long)
+
+        feasible_flat = self.feasible_nodes.view(-1, self.problem_size)
+        action_is_feasible = feasible_flat[dummy_ind, actions]
+        invalid_active = active_env & (~action_is_feasible)
+        if invalid_active.any():
+            fallback = feasible_flat[invalid_active].float().argmax(dim=-1).to(actions.dtype)
+            actions[invalid_active] = fallback
+
         from_depot = active_env & (head[:n_actions] == DEPOT_LOCATION)
         depot_visit = active_env & (actions == DEPOT_LOCATION)
         visit_site = actions.clone()
@@ -338,6 +346,7 @@ class PDPTW(VRPTW):
             'late_count': late_count,
             'masked_ratio': masked_ratio,
             'pair_blocked_ratio': blocked_ratio,
+            'hard_constraint_override_ratio': invalid_active.float().mean(),
             'constraint_penalty': constraint_penalty,
             'lagrangian_lambda_late_sum': self.lagrangian_state['late_sum']['lambda'],
             'lagrangian_lambda_late_count': self.lagrangian_state['late_count']['lambda'],

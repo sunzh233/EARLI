@@ -33,7 +33,7 @@ train:
   gae_lambda: 0.95
   clip_range: 0.15
   vf_coef: 0.5
-  ent_coef: 0.0
+  ent_coef: 0.003
   max_grad_norm: 0.4
   target_kl: 0.1
   sampling_mode: random_with_replacement
@@ -42,6 +42,7 @@ eval:
   data_file: datasets/vrptw_homberger_like_curriculum/vrptw_train_50.pkl
   val_data_file: datasets/vrptw_homberger_like_curriculum/vrptw_val_50.pkl
   n_eval_episodes: 50
+  sampling_mode: random_with_replacement
   max_problems: null
   apply_local_search: false
   deterministic_test_beam: true
@@ -58,8 +59,8 @@ problem_setup:
   time_penalty: 0.0
   time_penalty_early: 0.0
   time_penalty_late: 1.0
-  vehicle_penalty: 10
-  unused_capacity_penalty: 0.2
+  vehicle_penalty: 14
+  unused_capacity_penalty: 0.3
   # Constraint shaping and lagrangian dual control.
   use_lagrangian_constraints: true
   lagrangian_lr: 5e-5
@@ -70,13 +71,19 @@ problem_setup:
   penalty_late_count: 0.10
   penalty_masked_ratio: 0.02
   penalty_pair_blocked: 0.0
+  penalty_depot_with_customer: 0.04
+  penalty_vehicle_over_lb: 0.12
   # Target violation levels for dual update
   target_late_sum: 0.0
   target_late_count: 0.0
   target_masked_ratio: 0.10
   target_pair_blocked: 0.0
+  target_depot_with_customer: 0.05
+  target_vehicle_over_lb: 0.08
   spare_numeric_capacity: 0
   single_site_visit: true
+  strict_action_mask_train: true
+  strict_action_mask_infer: true
 
 representation:
   input_repr: Graph
@@ -100,14 +107,14 @@ model:
   num_intermediate_features: 512
   use_bias: true
   agg_type: sum
-  edge_model_layers: 2
+  edge_model_layers: 3
   value_from_depot: false
   reset_layers_freq: 0
   reset_last_layers: false
   reset_last_k_modules: 0
   single_network: false
   attention: true
-  split_actor_and_state_models: false
+  split_actor_and_state_models: true
   lazy: true
   eight_rounding: false
 

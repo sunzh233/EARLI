@@ -95,6 +95,9 @@ for size, model in models:
     with open(summary_path, 'rb') as f:
         res = pickle.load(f)
     df = res['summary']
+    success_col = 'success_verification' if 'success_verification' in df.columns else (
+        'success2' if 'success2' in df.columns else None
+    )
 
     for method in ['cuOpt', 'cuOpt_RL']:
         sub = df[(df['method'] == method) & (df['total_runtime'] == 15.0)]
@@ -102,7 +105,7 @@ for size, model in models:
             'model_size': size,
             'method': method,
             'total_runtime': 15.0,
-            'success_rate': float(sub['success2'].mean()) if len(sub) else np.nan,
+            'success_rate': float(sub[success_col].mean()) if (len(sub) and success_col is not None) else np.nan,
             'mean_cost': float(sub['cost'].mean()) if len(sub) else np.nan,
             'mean_vehicles': float(sub['vehicles'].mean()) if len(sub) else np.nan,
             'rl_mean_reward': rl_mean_reward,

@@ -76,7 +76,7 @@ class PosAttentionModel(AbstractNetwork, ActorCriticPolicy):
         )
         if self.config['system']['compatibility_mode'] == 'stable_baselines':
             action, log_prob, entropy = self.sampler.sample(policy_logits, unmasked_nodes=state['feasible_nodes'].to(bool),
-                                                            deterministic=False)
+                                                            deterministic=deterministic)
             log_prob = log_prob.squeeze(1)
             return action, values, log_prob
         else:

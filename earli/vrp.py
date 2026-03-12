@@ -209,10 +209,15 @@ class VRP(RoutingBase):
             self.set_problem_data(data=self.data)
         # For training, optionally randomize dataset sampling so each rollout
         # uses a small random subset rather than a deterministic cyclic slice.
-        sampling_mode = self.config.get('train', {}).get('sampling_mode', 'cyclic')
+        if self.env_type == 'train':
+            sampling_mode = self.config.get('train', {}).get('sampling_mode', 'cyclic')
+        elif self.env_type == 'eval':
+            sampling_mode = self.config.get('eval', {}).get('sampling_mode', 'cyclic')
+        else:
+            sampling_mode = 'cyclic'
+
         if (
             self.fix_envs
-            and self.env_type == 'train'
             and isinstance(sampling_mode, str)
             and sampling_mode.lower() in {'random', 'random_with_replacement'}
         ):

@@ -279,38 +279,58 @@ class SearchTree(object):
                                                   self.action_head_source[terminal_actions].unsqueeze(-1)], dim=1)
         if light_buffer:
             terminal_states_returns = self.buffer['rewards'].sum(dim=0)
-            terminal_actions_positions[:, 0] += 1
-            best_return, best_return_index = terminal_states_returns.max(dim=1)
+            _, best_return_index = terminal_states_returns.max(dim=1)
             max_t, n_problems, k_beams, = self.buffer['actions'].shape
-            actions = self.buffer['actions'].permute(1, 2, 0)
-            actions = torch.cat([torch.zeros([actions.shape[0], actions.shape[1], 1], dtype=actions.dtype, device=actions.device),
-                                 actions], dim=2)
-
-            # # Create a tensor to hold the indices of the first True value for each (i, j) pair
-            terminal_indices = terminal_actions_positions.transpose(1,0).unbind()
-            first_true_indices = torch.full((n_problems, k_beams), max_t - 1, dtype=torch.long, device=actions.device)
-            first_true_indices[terminal_indices[1], terminal_indices[2]] = terminal_indices[0]
-
-            if self.config['problem_setup']['minimize_vehicles']:
-                # Sort terminal_actions_positions lexicographically by problem_id & beam_id
-                composite_key = terminal_actions_positions[:, 1] * k_beams + terminal_actions_positions[:, 2]
-                sort_indices = torch.argsort(composite_key)
-                sorted_terminal_positions = terminal_actions_positions[sort_indices]
-                vehicles_per_beam = sorted_terminal_positions[:,0].reshape(n_problems, k_beams)
-                best_solution_per_problem, best_vehicles = self._select_best_beam(terminal_states_returns, vehicles_per_beam)
-            else:
-                best_solution_per_problem, best_vehicles = best_return_index, None
 
             all_routes = []
+            terminal_step_per_beam = torch.full(
+                (n_problems, k_beams), -1, dtype=torch.long, device=self.buffer['actions'].device
+            )
+            if terminal_actions_positions.numel() > 0:
+                terminal_step_per_beam[
+                    terminal_actions_positions[:, 1], terminal_actions_positions[:, 2]
+                ] = terminal_actions_positions[:, 0]
+
             for i in range(n_problems):
                 problem_list = []
                 for j in range(k_beams):
-                    # Find the index of the first `True` entry in `terminal_actions[i, j]`
-                    first_true_index = first_true_indices[i,j]
-                    # Slice the `actions[i, j]` tensor up to this index and convert to list
-                    action_list = actions[i, j, :first_true_index + 1]
-                    problem_list.append(action_list)
+                    t_end = int(terminal_step_per_beam[i, j].item())
+                    if t_end < 0:
+                        route = torch.tensor([0], dtype=torch.long, device=self.buffer['actions'].device)
+                    else:
+                        terminal_beam = int(self.action_head_source[t_end, i, j].item())
+                        terminal_action = torch.tensor(j, dtype=torch.int, device=self.buffer['actions'].device)
+                        _, action_index, _ = self.get_trajectory_upto_head(
+                            t_end, i, terminal_beam=terminal_beam,
+                            terminal_action=terminal_action, calculate_buffer=False,
+                        )
+                        reference_buffer = self.buffer[:t_end + 1, i]
+                        dummy_ind = torch.arange(t_end + 1, dtype=torch.int, device=action_index.device)
+                        actions_seq = reference_buffer['actions'][dummy_ind, action_index]
+                        route = torch.cat([
+                            torch.tensor([0], dtype=actions_seq.dtype, device=actions_seq.device),
+                            actions_seq,
+                        ])
+                    problem_list.append(route)
                 all_routes.append(problem_list)
+
+            if self.config['problem_setup']['minimize_vehicles']:
+                vehicles_per_beam = torch.tensor(
+                    [[max(int((route == 0).sum().item()) - 1, 0) for route in problem_routes]
+                     for problem_routes in all_routes],
+                    dtype=torch.float,
+                    device=terminal_states_returns.device,
+                )
+                best_solution_per_problem, best_vehicles = self._select_best_beam(
+                    terminal_states_returns, vehicles_per_beam
+                )
+            else:
+                best_solution_per_problem, best_vehicles = best_return_index, None
+
+            best_return = terminal_states_returns[
+                torch.arange(n_problems, device=terminal_states_returns.device),
+                best_solution_per_problem,
+            ]
             optimal_route = [routes[ind] for routes, ind in zip(all_routes, best_solution_per_problem)]
         else:
             # we also sum up the rewards of the terminal states, but it is more complex

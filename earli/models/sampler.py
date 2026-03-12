@@ -342,10 +342,27 @@ class Sampler(object):
             if self.temperature != 1:
                 logits = logits ** (1 / self.temperature)
             probs = logits if prior is None else logits * prior
-            zero_rows = probs.sum(dim=-1) == 0  # todo: does it take a lot of time
+            zero_rows = probs.sum(dim=-1) == 0
             if zero_rows.any():
                 print('zero rows found in probs, setting to 1 at unmasked actions')
                 probs[zero_rows] = unmasked_nodes[zero_rows].to(probs.dtype)
+
+            # If an entire row is masked (no legal actions), force a safe fallback
+            # to depot/action-0 to keep sampling stable during eval/training.
+            fully_masked_rows = (~unmasked_nodes).all(dim=-1)
+            if fully_masked_rows.any():
+                probs[fully_masked_rows] = 0
+                probs[fully_masked_rows, 0] = 1
+
+            # Numerical guard: remove NaN/Inf and renormalize to a valid simplex.
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            row_sums = probs.sum(dim=-1, keepdim=True)
+            bad_rows = (~torch.isfinite(row_sums)).squeeze(-1) | (row_sums.squeeze(-1) <= 0)
+            if bad_rows.any():
+                probs[bad_rows] = 0
+                probs[bad_rows, 0] = 1
+                row_sums = probs.sum(dim=-1, keepdim=True)
+            probs = probs / row_sums.clamp_min(1e-12)
             dist = th.distributions.categorical.Categorical(probs=probs, validate_args=True)
         elif score_to_prob == 'logits':
             assert logits is None or prior is None, 'need to verify that logits and prior works together'

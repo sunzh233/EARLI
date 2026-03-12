@@ -15,26 +15,25 @@ train:
   method: "tree_based"
   optimizer: "adam"
   seed: 0
-  deterministic_algo: true
+  deterministic_algo: false
   gamma: 1
   multi_gpu: false
   block_decreasing_action: false
-  epochs: 16
+  epochs: 0
   batch_size: 512
-  n_beams: 8
-  pretrained_fname: null
+  n_beams: 16
+  pretrained_fname: "outputs/hybrid/models/vrptw_model_synth_hybrid_1000.m"
   pretrained_run: null
-  save_model_path: "outputs/vrptw_model_homberger_tree_800.m"
-  n_parallel_problems: 16
+  save_model_path: "outputs/hybrid/models/vrptw_model_synth_hybrid_1000.m"
+  n_parallel_problems: 2
   learning_rate: 1e-4
 
 eval:
-  data_file: datasets/homberger_vrptw_curriculum/vrptw_train_200.pkl
-  val_data_file: datasets/homberger_vrptw_curriculum/vrptw_val_200.pkl
+  data_file: datasets/vrptw_homberger_like_curriculum/vrptw_test_homberger_1000.pkl
   max_problems: null
-  apply_local_search: false
-  deterministic_test_beam: true
-  detailed_test_log: false
+  apply_local_search: true
+  deterministic_test_beam: false
+  detailed_test_log: true
   save_full_tree: false
   naive_greedy: false
 
@@ -47,24 +46,8 @@ problem_setup:
   time_penalty: 0.0
   time_penalty_early: 0.0
   time_penalty_late: 1.0
-  vehicle_penalty: 50
-  unused_capacity_penalty: 0.2
-  use_lagrangian_constraints: true
-  lagrangian_lr: 5e-5
-  lagrangian_ema: 0.05
-  lagrangian_max: 10.0
-  penalty_late_sum: 0.02
-  penalty_late_count: 0.1
-  penalty_masked_ratio: 0.02
-  penalty_pair_blocked: 0.0
-  penalty_depot_with_customer: 0.02
-  penalty_vehicle_over_lb: 0.08
-  target_late_sum: 0.0
-  target_late_count: 0.0
-  target_masked_ratio: 0.1
-  target_pair_blocked: 0.0
-  target_depot_with_customer: 0.05
-  target_vehicle_over_lb: 0.10
+  vehicle_penalty: 24
+  unused_capacity_penalty: 0.5
   spare_numeric_capacity: 0
   single_site_visit: true
   strict_action_mask_train: true
@@ -92,7 +75,7 @@ model:
   num_intermediate_features: 512
   use_bias: true
   agg_type: sum
-  edge_model_layers: 2
+  edge_model_layers: 3
   value_from_depot: false
   reset_layers_freq: 0
   reset_last_layers: false
@@ -117,8 +100,8 @@ attention_model:
 
 sampler:
   score_to_prob: probs
-  temperature: 0.3
-  diversity_penalty: 0.02
+  temperature: 0.2
+  diversity_penalty: 0.01
   normalize_attention: true
   tanh_clipping: 10
   complement_k_beams_calc: false
@@ -127,13 +110,13 @@ sampler:
 
 muzero:
   expansion_method: "KPPO"
-  deterministic_branch_in_k_beams: true
+  deterministic_branch_in_k_beams: false
   zeroize_deterministic_log_prob: false
   loss_type: "ppo"
-  max_leaves: 10
-  data_steps_per_epoch: 256
+  max_leaves: 16
+  data_steps_per_epoch: 320
   hash_states: true
-  max_moves: 8000
+  max_moves: 12000
 
 speedups:
   use_ray: false

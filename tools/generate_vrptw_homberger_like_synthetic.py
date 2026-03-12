@@ -33,6 +33,10 @@ DEFAULT_COUNTS = {
     1000: 100,
 }
 
+DISTANCE_BUCKET_EDGES = np.linspace(0.0, 1.0, 6, dtype=np.float32)
+DEPOT_REACHABILITY_MARGIN = 5.0
+MAX_ILLEGAL_NODE_RESAMPLE = 8
+
 
 def parse_counts(items: list[str]) -> dict[int, int]:
     out: dict[int, int] = {}
@@ -48,6 +52,35 @@ def _save_pkl(path: Path, obj: dict) -> None:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def _build_distance_conditioned_pools(
+    dist_ratio_pool: np.ndarray,
+    ready_ratio_pool: np.ndarray,
+    width_ratio_pool: np.ndarray,
+    bin_edges: np.ndarray,
+) -> dict:
+    # Bucketize distance-ratio and keep empirical ready/width pools per bucket.
+    n_bins = len(bin_edges) - 1
+    # right=False gives intervals [edge_i, edge_{i+1}) except the last edge.
+    bucket_ids = np.digitize(dist_ratio_pool, bin_edges[1:-1], right=False)
+
+    ready_by_bucket = []
+    width_by_bucket = []
+    for b in range(n_bins):
+        mask = bucket_ids == b
+        if np.any(mask):
+            ready_by_bucket.append(ready_ratio_pool[mask].astype(np.float32))
+            width_by_bucket.append(width_ratio_pool[mask].astype(np.float32))
+        else:
+            ready_by_bucket.append(np.empty((0,), dtype=np.float32))
+            width_by_bucket.append(np.empty((0,), dtype=np.float32))
+
+    return {
+        "distance_bucket_edges": bin_edges.astype(np.float32),
+        "ready_ratio_by_bucket": ready_by_bucket,
+        "width_ratio_by_bucket": width_by_bucket,
+    }
+
+
 def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per_size: int) -> dict:
     demand_pool = []
     service_pool = []
@@ -55,6 +88,7 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
     xy_pool = []
     ready_ratio_pool = []
     width_ratio_pool = []
+    dist_ratio_pool = []
     depot_due_by_size = {}
 
     # Per-category pools (e.g., R, C, RC, other)
@@ -136,6 +170,11 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
 
             ready_ratio = np.clip(tw[1:, 0] / horizon, 0.0, 1.0)
             width_ratio = np.clip((tw[1:, 1] - tw[1:, 0]) / horizon, 0.0, 1.0)
+            # Distance ratio in normalized coordinates: [0, 1] roughly maps
+            # near-to-far customers relative to depot for conditional TW sampling.
+            depot_xy = pos_norm[0]
+            dist_ratio = np.linalg.norm(pos_norm[1:] - depot_xy[None, :], axis=1) / np.sqrt(2.0)
+            dist_ratio = np.clip(dist_ratio, 0.0, 1.0)
 
             demand_pool.append(dem[1:])
             service_pool.append(svc[1:])
@@ -143,6 +182,7 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
             xy_pool.append(pos_norm)
             ready_ratio_pool.append(ready_ratio)
             width_ratio_pool.append(width_ratio)
+            dist_ratio_pool.append(dist_ratio)
             depot_dues.append(float(tw[0, 1]))
 
             # also accumulate into category-specific pools
@@ -152,6 +192,7 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
             cat_pools[cat]['xy_pool'].append(pos_norm)
             cat_pools[cat]['ready_ratio_pool'].append(ready_ratio)
             cat_pools[cat]['width_ratio_pool'].append(width_ratio)
+            cat_pools[cat].setdefault('dist_ratio_pool', []).append(dist_ratio)
             cat_pools[cat]['depot_dues'].append(float(tw[0, 1]))
 
             # accumulate into group-specific pools
@@ -161,6 +202,7 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
             group_pools[grp]['xy_pool'].append(pos_norm)
             group_pools[grp]['ready_ratio_pool'].append(ready_ratio)
             group_pools[grp]['width_ratio_pool'].append(width_ratio)
+            group_pools[grp].setdefault('dist_ratio_pool', []).append(dist_ratio)
             group_pools[grp]['depot_dues'].append(float(tw[0, 1]))
 
         if depot_dues:
@@ -192,13 +234,25 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
         except Exception:
             cat_poly = horizon_poly.astype(np.float32)
 
+        cat_dist_pool = np.concatenate(pools.get('dist_ratio_pool', [np.empty((0,), dtype=np.float32)])).astype(np.float32)
+        cat_ready_pool = np.concatenate(pools['ready_ratio_pool']).astype(np.float32)
+        cat_width_pool = np.concatenate(pools['width_ratio_pool']).astype(np.float32)
+        cat_bucket = _build_distance_conditioned_pools(
+            cat_dist_pool,
+            cat_ready_pool,
+            cat_width_pool,
+            DISTANCE_BUCKET_EDGES,
+        )
+
         by_category[cat] = {
             'demand_pool': np.concatenate(pools['demand_pool']).astype(np.float32),
             'service_pool': np.concatenate(pools['service_pool']).astype(np.float32),
             'capacity_pool': np.array(pools['capacity_pool'], dtype=np.float32),
             'xy_pool': np.concatenate(pools['xy_pool'], axis=0).astype(np.float32),
-            'ready_ratio_pool': np.concatenate(pools['ready_ratio_pool']).astype(np.float32),
-            'width_ratio_pool': np.concatenate(pools['width_ratio_pool']).astype(np.float32),
+            'ready_ratio_pool': cat_ready_pool,
+            'width_ratio_pool': cat_width_pool,
+            'dist_ratio_pool': cat_dist_pool,
+            **cat_bucket,
             'horizon_poly': cat_poly,
         }
 
@@ -216,23 +270,47 @@ def _collect_homberger_reference(root: Path, fit_sizes: list[int], max_files_per
         except Exception:
             grp_poly = horizon_poly.astype(np.float32)
 
+        grp_dist_pool = np.concatenate(pools.get('dist_ratio_pool', [np.empty((0,), dtype=np.float32)])).astype(np.float32)
+        grp_ready_pool = np.concatenate(pools['ready_ratio_pool']).astype(np.float32)
+        grp_width_pool = np.concatenate(pools['width_ratio_pool']).astype(np.float32)
+        grp_bucket = _build_distance_conditioned_pools(
+            grp_dist_pool,
+            grp_ready_pool,
+            grp_width_pool,
+            DISTANCE_BUCKET_EDGES,
+        )
+
         by_group[grp] = {
             'demand_pool': np.concatenate(pools['demand_pool']).astype(np.float32),
             'service_pool': np.concatenate(pools['service_pool']).astype(np.float32),
             'capacity_pool': np.array(pools['capacity_pool'], dtype=np.float32),
             'xy_pool': np.concatenate(pools['xy_pool'], axis=0).astype(np.float32),
-            'ready_ratio_pool': np.concatenate(pools['ready_ratio_pool']).astype(np.float32),
-            'width_ratio_pool': np.concatenate(pools['width_ratio_pool']).astype(np.float32),
+            'ready_ratio_pool': grp_ready_pool,
+            'width_ratio_pool': grp_width_pool,
+            'dist_ratio_pool': grp_dist_pool,
+            **grp_bucket,
             'horizon_poly': grp_poly,
         }
+
+    global_dist_pool = np.concatenate(dist_ratio_pool).astype(np.float32)
+    global_ready_pool = np.concatenate(ready_ratio_pool).astype(np.float32)
+    global_width_pool = np.concatenate(width_ratio_pool).astype(np.float32)
+    global_bucket = _build_distance_conditioned_pools(
+        global_dist_pool,
+        global_ready_pool,
+        global_width_pool,
+        DISTANCE_BUCKET_EDGES,
+    )
 
     return {
         "demand_pool": np.concatenate(demand_pool).astype(np.float32),
         "service_pool": np.concatenate(service_pool).astype(np.float32),
         "capacity_pool": np.array(capacity_pool, dtype=np.float32),
         "xy_pool": np.concatenate(xy_pool, axis=0).astype(np.float32),
-        "ready_ratio_pool": np.concatenate(ready_ratio_pool).astype(np.float32),
-        "width_ratio_pool": np.concatenate(width_ratio_pool).astype(np.float32),
+        "ready_ratio_pool": global_ready_pool,
+        "width_ratio_pool": global_width_pool,
+        "dist_ratio_pool": global_dist_pool,
+        **global_bucket,
         "horizon_poly": horizon_poly.astype(np.float32),
         "by_category": by_category,
         "by_group": by_group,
@@ -269,16 +347,98 @@ def _sample_instance(n_customers: int, ref: dict, rng: np.random.Generator) -> d
     tw[0, 0] = 0.0
     tw[0, 1] = horizon
 
-    rr_idx = rng.integers(0, len(ref["ready_ratio_pool"]), size=n_customers)
-    wr_idx = rng.integers(0, len(ref["width_ratio_pool"]), size=n_customers)
-    ready_ratio = np.clip(ref["ready_ratio_pool"][rr_idx], 0.0, 0.98)
-    width_ratio = np.clip(ref["width_ratio_pool"][wr_idx], 0.01, 1.0)
+    # Distance-conditioned sampling for TW ratios.
+    depot_xy = positions[0]
+    dist_ratio = np.linalg.norm(positions[1:] - depot_xy[None, :], axis=1) / (np.sqrt(2.0) * max_coord)
+    dist_ratio = np.clip(dist_ratio, 0.0, 1.0)
+
+    edges = ref.get("distance_bucket_edges", DISTANCE_BUCKET_EDGES)
+    ready_by_bucket = ref.get("ready_ratio_by_bucket", None)
+    width_by_bucket = ref.get("width_ratio_by_bucket", None)
+
+    if ready_by_bucket is None or width_by_bucket is None:
+        rr_idx = rng.integers(0, len(ref["ready_ratio_pool"]), size=n_customers)
+        wr_idx = rng.integers(0, len(ref["width_ratio_pool"]), size=n_customers)
+        ready_ratio = np.clip(ref["ready_ratio_pool"][rr_idx], 0.0, 0.98)
+        width_ratio = np.clip(ref["width_ratio_pool"][wr_idx], 0.01, 1.0)
+    else:
+        bucket_ids = np.digitize(dist_ratio, np.asarray(edges)[1:-1], right=False)
+        ready_ratio = np.zeros((n_customers,), dtype=np.float32)
+        width_ratio = np.zeros((n_customers,), dtype=np.float32)
+        for i, b in enumerate(bucket_ids):
+            b = int(np.clip(b, 0, len(ready_by_bucket) - 1))
+            ready_pool = ready_by_bucket[b]
+            width_pool = width_by_bucket[b]
+
+            if len(ready_pool) == 0:
+                ready_pool = ref["ready_ratio_pool"]
+            if len(width_pool) == 0:
+                width_pool = ref["width_ratio_pool"]
+
+            ready_ratio[i] = float(ready_pool[rng.integers(0, len(ready_pool))])
+            width_ratio[i] = float(width_pool[rng.integers(0, len(width_pool))])
+
+        ready_ratio = np.clip(ready_ratio, 0.0, 0.98)
+        width_ratio = np.clip(width_ratio, 0.01, 1.0)
 
     ready = np.floor(ready_ratio * horizon)
     width = np.floor(width_ratio * horizon)
     width = np.clip(width, 5.0, horizon)
     due = np.minimum(horizon, ready + width)
     due = np.maximum(due, ready + 5.0)
+
+    # Enforce depot-reachability at node level:
+    # for each customer j, require due_j >= service(depot) + dist(depot, j) + margin.
+    service_depot = float(service[0])
+    travel_from_depot = np.linalg.norm(positions[1:] - depot_xy[None, :], axis=1)
+    min_due = service_depot + travel_from_depot + DEPOT_REACHABILITY_MARGIN
+
+    illegal = due < min_due
+    if np.any(illegal):
+        # First try local per-node resampling so we keep marginal diversity.
+        for _ in range(MAX_ILLEGAL_NODE_RESAMPLE):
+            idxs = np.where(illegal)[0]
+            if idxs.size == 0:
+                break
+            for j in idxs:
+                b = int(np.clip(bucket_ids[j], 0, len(ready_by_bucket) - 1)) if ready_by_bucket is not None else 0
+                if ready_by_bucket is None or width_by_bucket is None:
+                    rr = float(ref["ready_ratio_pool"][rng.integers(0, len(ref["ready_ratio_pool"]))])
+                    wr = float(ref["width_ratio_pool"][rng.integers(0, len(ref["width_ratio_pool"]))])
+                else:
+                    ready_pool = ready_by_bucket[b]
+                    width_pool = width_by_bucket[b]
+                    if len(ready_pool) == 0:
+                        ready_pool = ref["ready_ratio_pool"]
+                    if len(width_pool) == 0:
+                        width_pool = ref["width_ratio_pool"]
+                    rr = float(ready_pool[rng.integers(0, len(ready_pool))])
+                    wr = float(width_pool[rng.integers(0, len(width_pool))])
+
+                rr = float(np.clip(rr, 0.0, 0.98))
+                wr = float(np.clip(wr, 0.01, 1.0))
+                rj = np.floor(rr * horizon)
+                wj = np.floor(wr * horizon)
+                wj = np.clip(wj, 5.0, horizon)
+                dj = min(horizon, rj + wj)
+                dj = max(dj, rj + 5.0)
+                ready[j] = rj
+                due[j] = dj
+
+            illegal = due < min_due
+            if not np.any(illegal):
+                break
+
+    if np.any(illegal):
+        # Final hard guarantee: force due to be reachable from depot.
+        due[illegal] = min_due[illegal]
+        ready[illegal] = np.minimum(ready[illegal], due[illegal] - 5.0)
+
+    # If enforcing min_due pushes due beyond horizon, expand instance horizon.
+    required_horizon = float(np.max(due)) if due.size > 0 else horizon
+    if required_horizon > horizon:
+        horizon = required_horizon + 5.0
+        tw[0, 1] = horizon
 
     tw[1:, 0] = ready.astype(np.float32)
     tw[1:, 1] = due.astype(np.float32)
@@ -292,6 +452,23 @@ def _sample_instance(n_customers: int, ref: dict, rng: np.random.Generator) -> d
     }
 
 
+def _is_reachable_from_depot_before_due(inst: dict, eps: float = 1e-6) -> bool:
+    """Check per-node depot reachability feasibility for VRPTW.
+
+    A customer is considered feasible only if a vehicle starting at node 0 can
+    arrive before the customer's due time.
+    """
+    pos = inst["positions"]
+    tw = inst["time_windows"]
+    svc = inst["service_times"]
+
+    depot = pos[0]
+    due = tw[1:, 1]
+    travel = np.linalg.norm(pos[1:] - depot[None, :], axis=1)
+    arrive = float(svc[0]) + travel
+    return bool(np.all(arrive <= due + eps))
+
+
 def _build_dataset(n_customers: int, n_instances: int, ref: dict, seed: int, chunk_size: int) -> dict:
     rng = np.random.default_rng(seed)
     n_nodes = n_customers + 1
@@ -303,6 +480,7 @@ def _build_dataset(n_customers: int, n_instances: int, ref: dict, seed: int, chu
     tw_chunks = []
     svc_chunks = []
     ids = []
+    rejected_unreachable = 0
 
     for start in range(0, n_instances, chunk_size):
         cur = min(chunk_size, n_instances - start)
@@ -312,14 +490,20 @@ def _build_dataset(n_customers: int, n_instances: int, ref: dict, seed: int, chu
         service_times = np.zeros((cur, n_nodes), dtype=np.float32)
         capacities = np.zeros((cur,), dtype=np.float32)
 
-        for i in range(cur):
+        i = 0
+        while i < cur:
             inst = _sample_instance(n_customers, ref, rng)
+            if not _is_reachable_from_depot_before_due(inst):
+                rejected_unreachable += 1
+                continue
+
             positions[i] = inst["positions"]
             demand[i] = inst["demand"]
             time_windows[i] = inst["time_windows"]
             service_times[i] = inst["service_times"]
             capacities[i] = inst["capacity"]
             ids.append(f"synthetic_{n_customers}_{start + i:06d}")
+            i += 1
 
         pos_t = torch.from_numpy(positions)
         dm = torch.cdist(pos_t, pos_t, p=2)
@@ -351,6 +535,7 @@ def _build_dataset(n_customers: int, n_instances: int, ref: dict, seed: int, chu
         "n_problems": n_instances,
         "radius": float(np.abs(positions_arr).max()),
         "id": np.array(ids),
+        "rejected_unreachable_from_depot": int(rejected_unreachable),
     }
 
 
@@ -452,6 +637,8 @@ def main() -> None:
             seed=int(args.seed) + i,
             chunk_size=int(args.chunk_size),
         )
+        rej = int(dataset.get("rejected_unreachable_from_depot", 0))
+        print(f"  filtered(unreachable_from_depot)={rej}")
         train_ds, val_ds = _split_dataset(dataset, float(args.train_ratio), seed=int(args.seed) + 100 + i)
 
         train_path = out_dir / f"vrptw_train_{n_customers}.pkl"
