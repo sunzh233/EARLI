@@ -21,6 +21,8 @@ def env_dynamic_embedding(env_name: str, config: dict) -> nn.Module:
         "tsp": StaticEmbedding,
         "atsp": StaticEmbedding,
         "cvrp": StaticEmbedding,
+        "vrp": StaticEmbedding,
+        "vrptw": StaticEmbedding,
         "sdvrp": SDVRPDynamicEmbedding,
         "pctsp": StaticEmbedding,
         "spctsp": StaticEmbedding,
@@ -28,6 +30,7 @@ def env_dynamic_embedding(env_name: str, config: dict) -> nn.Module:
         "dpp": StaticEmbedding,
         "mdpp": StaticEmbedding,
         "pdp": StaticEmbedding,
+        "pdptw": StaticEmbedding,
         "mtsp": StaticEmbedding,
         "smtwtp": StaticEmbedding,
     }
