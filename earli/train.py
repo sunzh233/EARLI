@@ -696,6 +696,18 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
         # ---- PPO / REINFORCE gradient update ----
         n_samples  = len(obs_cat)
         batch_size = min(config['train']['batch_size'], n_samples)
+
+        # Epoch-level optimization diagnostics for TensorBoard.
+        epoch_policy_losses = []
+        epoch_value_losses = []
+        epoch_total_losses = []
+        epoch_entropies = []
+        epoch_approx_kls = []
+        epoch_clip_fractions = []
+        epoch_grad_norms = []
+        epoch_ratio_means = []
+        epoch_value_means = []
+
         model.train()
         for _ in range(n_ppo_epochs):
             indices = torch.randperm(n_samples)
@@ -710,6 +722,14 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
                 values, new_log_prob, entropy = model.evaluate_actions(obs_b, act_b)
                 values = values.squeeze(-1).float()
 
+                # Guard against mixed-device tensors returned by collector/model.
+                # Keep all PPO terms on the same device as the policy output.
+                pdev = new_log_prob.device
+                olp_b = olp_b.to(device=pdev)
+                adv_b = adv_b.to(device=pdev)
+                ret_b = ret_b.to(device=pdev)
+                values = values.to(device=pdev)
+
                 log_ratio = new_log_prob.float() - olp_b
                 ratio     = log_ratio.exp()
                 surr1 = ratio * adv_b
@@ -719,10 +739,24 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
                 value_loss  = F.mse_loss(values, ret_b)
                 loss        = policy_loss + value_coef * value_loss
 
+                approx_kl = (olp_b - new_log_prob.float()).mean()
+                clip_fraction = ((ratio - 1.0).abs() > clip_range).float().mean()
+                entropy_mean = entropy.float().mean()
+
                 model.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 model.optimizer.step()
+
+                epoch_policy_losses.append(float(policy_loss.detach().cpu().item()))
+                epoch_value_losses.append(float(value_loss.detach().cpu().item()))
+                epoch_total_losses.append(float(loss.detach().cpu().item()))
+                epoch_entropies.append(float(entropy_mean.detach().cpu().item()))
+                epoch_approx_kls.append(float(approx_kl.detach().cpu().item()))
+                epoch_clip_fractions.append(float(clip_fraction.detach().cpu().item()))
+                epoch_grad_norms.append(float(torch.as_tensor(grad_norm).detach().cpu().item()))
+                epoch_ratio_means.append(float(ratio.detach().float().mean().cpu().item()))
+                epoch_value_means.append(float(values.detach().float().mean().cpu().item()))
 
         model.eval()
 
@@ -737,6 +771,34 @@ def _train_pomo_tw(config, env_class, datafile, total_epochs):
             tb_writer.add_scalar('pomo_tw/epoch/training_samples', float(n_samples), epoch + 1)
             if mean_best is not None:
                 tb_writer.add_scalar('pomo_tw/epoch/mean_best_return', float(mean_best), epoch + 1)
+            # Data-distribution diagnostics
+            tb_writer.add_scalar('pomo_tw/epoch/returns_mean', float(returns_cat.mean().item()), epoch + 1)
+            tb_writer.add_scalar('pomo_tw/epoch/returns_std', float(returns_cat.std().item()), epoch + 1)
+            tb_writer.add_scalar('pomo_tw/epoch/returns_min', float(returns_cat.min().item()), epoch + 1)
+            tb_writer.add_scalar('pomo_tw/epoch/returns_max', float(returns_cat.max().item()), epoch + 1)
+            tb_writer.add_scalar('pomo_tw/epoch/advantage_mean', float(advantage.mean().item()), epoch + 1)
+            tb_writer.add_scalar('pomo_tw/epoch/advantage_std', float(advantage.std().item()), epoch + 1)
+
+            # Optimization diagnostics
+            if epoch_policy_losses:
+                tb_writer.add_scalar('pomo_tw/optim/policy_loss', float(np.mean(epoch_policy_losses)), epoch + 1)
+            if epoch_value_losses:
+                tb_writer.add_scalar('pomo_tw/optim/value_loss', float(np.mean(epoch_value_losses)), epoch + 1)
+            if epoch_total_losses:
+                tb_writer.add_scalar('pomo_tw/optim/total_loss', float(np.mean(epoch_total_losses)), epoch + 1)
+            if epoch_entropies:
+                tb_writer.add_scalar('pomo_tw/optim/entropy', float(np.mean(epoch_entropies)), epoch + 1)
+            if epoch_approx_kls:
+                tb_writer.add_scalar('pomo_tw/optim/approx_kl', float(np.mean(epoch_approx_kls)), epoch + 1)
+            if epoch_clip_fractions:
+                tb_writer.add_scalar('pomo_tw/optim/clip_fraction', float(np.mean(epoch_clip_fractions)), epoch + 1)
+            if epoch_grad_norms:
+                tb_writer.add_scalar('pomo_tw/optim/grad_norm', float(np.mean(epoch_grad_norms)), epoch + 1)
+            if epoch_ratio_means:
+                tb_writer.add_scalar('pomo_tw/optim/ratio_mean', float(np.mean(epoch_ratio_means)), epoch + 1)
+            if epoch_value_means:
+                tb_writer.add_scalar('pomo_tw/optim/value_pred_mean', float(np.mean(epoch_value_means)), epoch + 1)
+
             if hasattr(model, 'optimizer') and model.optimizer is not None:
                 lr = float(model.optimizer.param_groups[0]['lr'])
                 tb_writer.add_scalar('pomo_tw/epoch/learning_rate', lr, epoch + 1)

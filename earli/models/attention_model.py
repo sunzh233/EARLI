@@ -118,7 +118,11 @@ class PosAttentionModel(AbstractNetwork, ActorCriticPolicy):
                     and entropy of the action distribution.
         """
         values, logits, _ = self._forward(state=state, batch_shape=None, lazy=False)
-        _, log_prob, entropy = self.sampler.sample(logits, unmasked_nodes=state['feasible_nodes'].to(bool), action=actions,
+        # Keep masks/actions on the same device as logits to avoid CPU/CUDA gather errors.
+        device = logits.device
+        actions = actions.to(device=device)
+        unmasked_nodes = state['feasible_nodes'].to(device=device, dtype=torch.bool)
+        _, log_prob, entropy = self.sampler.sample(logits, unmasked_nodes=unmasked_nodes, action=actions,
                                                    deterministic=False)
         return values, log_prob, entropy
 

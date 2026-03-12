@@ -29,18 +29,23 @@ def augment_coords_8fold(positions: torch.Tensor) -> torch.Tensor:
                    The first ``n_problems`` rows correspond to the identity
                    transform (original coordinates).
     """
-    x = positions[..., 0:1]   # (n, nodes, 1)
-    y = positions[..., 1:2]   # (n, nodes, 1)
+    # Preserve device and dtype of input tensors
+    device = positions.device
+    dtype = positions.dtype
+    x = positions[..., 0:1].to(device=device, dtype=dtype)   # (n, nodes, 1)
+    y = positions[..., 1:2].to(device=device, dtype=dtype)   # (n, nodes, 1)
     # 8 distinct transformations: all combinations of (flip_x, flip_y, swap_xy)
+    # Create ones tensor on same device/dtype to avoid device mismatches
+    ones = x.new_ones(x.shape)
     variants = [
         torch.cat([x,         y        ], dim=-1),  # 0: identity
-        torch.cat([1.0 - x,   y        ], dim=-1),  # 1: flip x
-        torch.cat([x,         1.0 - y  ], dim=-1),  # 2: flip y
-        torch.cat([1.0 - x,   1.0 - y  ], dim=-1),  # 3: flip both
+        torch.cat([ones - x,  y        ], dim=-1),  # 1: flip x
+        torch.cat([x,         ones - y ], dim=-1),  # 2: flip y
+        torch.cat([ones - x,  ones - y ], dim=-1),  # 3: flip both
         torch.cat([y,         x        ], dim=-1),  # 4: swap
-        torch.cat([1.0 - y,   x        ], dim=-1),  # 5: swap + flip new-x
-        torch.cat([y,         1.0 - x  ], dim=-1),  # 6: swap + flip new-y
-        torch.cat([1.0 - y,   1.0 - x  ], dim=-1),  # 7: swap + flip both
+        torch.cat([ones - y,  x        ], dim=-1),  # 5: swap + flip new-x
+        torch.cat([y,         ones - x ], dim=-1),  # 6: swap + flip new-y
+        torch.cat([ones - y,  ones - x ], dim=-1),  # 7: swap + flip both
     ]
     return torch.cat(variants, dim=0)   # (8*n, nodes, 2)
 
@@ -99,7 +104,15 @@ def augment_vrptw_dataset(data: dict, n_augments: int = 8) -> dict:
 
     aug_data['n_problems'] = n_augments * n
     # Record which original problem each augmented instance came from.
-    aug_data['pomo_group'] = torch.arange(n).repeat(n_augments)  # (aug*n,)
+    # Keep pomo_group on same device as positions when possible.
+    try:
+        device = data['positions'].device
+    except Exception:
+        device = None
+    if device is not None:
+        aug_data['pomo_group'] = torch.arange(n, device=device).repeat(n_augments)
+    else:
+        aug_data['pomo_group'] = torch.arange(n).repeat(n_augments)
     return aug_data
 
 

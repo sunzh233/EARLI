@@ -1,1 +1,1 @@
-model not found: /home/sunzh/EARLI/outputs/hybrid/models/vrptw_model_synth_hybrid_100.m
+External solutions count mismatch: expected 60 problems from current dataset, got per-source counts [4] from logs ['outputs/test_logs.pkl']. Please regenerate test_logs with the same sampled subset.
